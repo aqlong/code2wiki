@@ -1,0 +1,55 @@
+{
+  "name": "code2wiki",
+  "version": "0.1.0",
+  "description": "Generate non-technical, use-case-style wiki pages from source code, auto-published to Confluence/Notion on every prod release.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Aaron Longnion <aqlong@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aqlong/code2wiki.git"
+  },
+  "bin": {
+    "code2wiki": "./dist/cli/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli/index.ts",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live-examples": "CODE2WIKI_RUN_LIVE_EXAMPLES=1 vitest run src/core/feedback/examples.live.test.ts",
+    "format": "prettier --write src",
+    "dashboard": "node tools/dashboard/server.mjs",
+    "check-key": "node tools/check-key.mjs",
+    "generate": "node dist/cli/index.js generate"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.95.0",
+    "commander": "^14.0.0",
+    "fast-glob": "^3.3.3",
+    "gray-matter": "^4.0.3",
+    "js-yaml": "^4.1.0",
+    "marked": "^15.0.12",
+    "tree-sitter": "^0.21.1",
+    "tree-sitter-java": "^0.23.5",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

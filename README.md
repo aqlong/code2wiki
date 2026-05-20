@@ -1,0 +1,193 @@
+# Code2Wiki
+
+> Confluence and Notion pages that always match the code your engineers just shipped, written for the BAs, QA, support, and auditors who never read your repo.
+
+**Status:** Working CLI MVP. End-to-end pipeline operational against real legacy CFML and Java repositories. Hosted SaaS layer (auto-publish to Confluence / Notion) coming next.
+
+
+## What this is
+
+Code2Wiki turns a source-code repository into **non-technical, use-case-style wiki pages**, the kind a business analyst, QA engineer, or auditor can actually read, and keeps them in sync with the code on every production release.
+
+Unlike developer-facing doc tools (Mintlify, Swimm, DeepWiki) and unlike enterprise-only legacy modernization platforms (EPAM ART, Sanciti RGEN, Kodesage), Code2Wiki is:
+
+- **Self-serve**: credit card, no sales call.
+- **Workflow-native**: pushes to your existing Confluence / Notion / GitHub Wiki on every merge.
+- **Audit-aware**: every doc change is attributed to a commit and replayable for SOX / HIPAA / FDA reviews.
+- **Legacy-friendly**: first-class support for ColdFusion (CFML), Java EE, .NET monoliths, where generalist tools fall over.
+
+## Quickstart
+
+```bash
+# 1. Install dependencies and build
+git clone https://github.com/aqlong/code2wiki.git
+cd code2wiki
+npm install
+npm run build
+
+# 2. List candidate use cases in any Java / CFML project
+node dist/cli/index.js list --cwd /path/to/your/project
+
+# 3. Generate use case Markdown (mock mode: no API key needed)
+node dist/cli/index.js generate --cwd /path/to/your/project --mock
+
+# 4. Generate with the real LLM
+export ANTHROPIC_API_KEY=sk-ant-...
+node dist/cli/index.js generate --cwd /path/to/your/project
+```
+
+The output lands in `./docs/use-cases/` by default, one Markdown file per use case, ready to paste into Confluence, Notion, or commit to your repo.
+
+## Languages supported (today)
+
+| Language | Parser | Status |
+|---|---|---|
+| Java (Spring, JAX-RS, plain) | tree-sitter-java | ✅ Working |
+| CFML, `.cfc` (tag style) | Custom scanner | ✅ Working |
+| CFML, `.cfc` (script style) | Custom scanner | ✅ Working |
+| CFML, `.cfm` pages | Custom scanner | ✅ Working |
+| Rails / Django / .NET | | Roadmap (week 5+) |
+
+## Publishing to Confluence or Notion
+
+After `code2wiki generate` writes Markdown to your output directory,
+`code2wiki publish <target>` pushes those pages into a real wiki:
+
+```bash
+# Set up credentials in .env (see .env.example)
+# Then dry-run to see what would be published:
+node dist/cli/index.js publish confluence --cwd /path/to/repo --dry-run
+
+# When you're happy, push for real:
+node dist/cli/index.js publish confluence --cwd /path/to/repo
+node dist/cli/index.js publish notion     --cwd /path/to/repo
+```
+
+**Idempotent slug-based upsert.** Each page is identified by its
+`code2wiki_id` (stable across regenerations). On every push:
+
+- New pages are created
+- Existing pages are updated in place (Confluence increments the
+  version number; Notion replaces the body and updates the title)
+- Human edits made *outside* the `<!-- code2wiki:managed -->` fence
+  are preserved in Confluence (the entire managed region is replaced;
+  anything before/after stays)
+
+**Notion setup quirk:** the destination database must have a Rich
+Text property named exactly `code2wiki_id` so the publisher can look
+up existing pages. Add it once before your first publish.
+
+**Coexistence with existing wikis (ADR-016, shipped 2026-05-07).** Three publish modes let you point code2wiki at a real legacy wiki space without overwriting hand-written content:
+
+- `greenfield` (default), touches only pages we previously created.
+- `claim`: preflight blocks the publish on title collisions; you adopt each conflicting page with `code2wiki claim <page-id-or-url> --target=<x> --map-to=<id>`. The original content is preserved outside the managed fence.
+- `parallel`: never touches unlabeled pages; nests our docs under a `code2wiki/` parent (Confluence) or `Section: code2wiki` rich-text property (Notion).
+
+Configure per-target in `code2wiki.config.json` under `publish.<target>.{mode, slugPrefix, titlePrefix, parentPageId, banner}`, or override at runtime with `--mode=<x>`. Every published page gets a 📝 attribution banner. Preflight results land in `.code2wiki/preflight.json` so CI can inspect them. See [docs/wiki-coexistence.md](docs/wiki-coexistence.md) for the full design.
+
+## Audit log (compliance-friendly)
+
+Every `generate` and `publish` writes a hash-chained entry to
+`.code2wiki/audit.jsonl`:
+
+```bash
+node dist/cli/index.js audit show         # last 20 entries
+node dist/cli/index.js audit verify       # check chain integrity
+```
+
+Each entry records the timestamp, commit SHA, page slug, outcome
+(created / updated / unchanged / skipped / error), content SHA-256,
+and the previous entry's hash. Tampering with any entry breaks the
+chain and is detected by `audit verify`.
+
+For SOX, HIPAA, and FDA-validation buyers: commit the audit log to
+your repo (remove `.code2wiki/` from `.gitignore`) and the chain
+becomes a tamper-evident record of every doc change tied to a commit.
+
+## Auto-running on every commit
+
+Drop [`.github/workflows/code2wiki.yml`](.github/workflows/code2wiki.yml) into your project. On every push to `main`, it:
+
+1. Installs and builds code2wiki
+2. Runs `code2wiki generate` against your repo
+3. Commits any updated use-case docs back into `docs/use-cases/`
+4. (Future: pushes them to Confluence / Notion via OAuth)
+
+For mock mode (no API key required), the workflow falls through to `--mock` automatically and emits clearly-marked draft pages so the pipeline runs end-to-end in CI.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│  OSS CLI (this repo, MIT)                   │
+│  - Tree-sitter (Java) + scanner (CFML)      │
+│  - Anthropic SDK with prompt caching        │
+│  - Deterministic mock for tests / no-key    │
+│  - Stable IDs + idempotent slugs            │
+└────────────────┬────────────────────────────┘
+                 │ same engine
+┌────────────────▼────────────────────────────┐
+│  Hosted SaaS (proprietary, separate repo)   │
+│  - GitHub/GitLab app, push-to-main webhook  │
+│  - Diff-aware regen on changed files only   │
+│  - Confluence + Notion + GitHub Wiki sync   │
+│  - Signed audit log of every doc change     │
+└─────────────────────────────────────────────┘
+```
+
+Full design rationale in [`docs/architecture.md`](docs/architecture.md).
+
+## Worked examples
+
+Hand-curated gold-standard outputs that double as the regression test suite:
+
+- [`examples/spring-petclinic-owner-create/`](examples/spring-petclinic-owner-create/), Java/Spring controller, owner registration form
+- [`examples/masacms-publish-site/`](examples/masacms-publish-site/), CFML tag-based, site deployment to production
+
+Each example contains the upstream source pointer, the ideal Markdown output, and notes on what makes it interesting.
+
+## Repo layout
+
+```
+code2wiki/
+├── README.md
+├── LICENSE                      # MIT
+├── package.json
+├── tsconfig.json
+├── vitest.config.ts
+├── src/
+│   ├── cli/                     # commander entry + commands
+│   ├── core/                    # extraction engine
+│   │   ├── parsers/             # Java (tree-sitter), CFML (scanner)
+│   │   ├── llm/                 # Anthropic client + prompts + mock
+│   │   ├── extractor.ts         # candidate → UseCase
+│   │   ├── renderer.ts          # UseCase → Markdown
+│   │   ├── scan.ts              # walk project, run parsers
+│   │   ├── config.ts            # config schema (zod)
+│   │   ├── git.ts               # commit metadata helpers
+│   │   ├── types.ts             # shared types
+│   │   └── util/                # slug, lines
+│   └── index.ts                 # library entry
+├── examples/                    # gold-standard demos + regression fixtures
+├── scripts/                     # dev utilities (snapshots, prompt-test)
+├── tools/                       # local dashboard, check-key, pr-summary
+├── references/                  # cloned demo codebases (gitignored)
+└── .github/workflows/           # CI + auto-regenerate
+```
+
+## Development
+
+```bash
+npm install        # install dependencies
+npm run build      # compile to dist/
+npm run typecheck  # tsc --noEmit
+npm test           # vitest
+npm run dev        # run CLI without building (tsx)
+```
+
+Tests run without an LLM key (deterministic mock mode). Real LLM integration requires `ANTHROPIC_API_KEY` and respects 24-hour prompt caching to keep costs low.
+
+## License
+
+MIT (see [LICENSE](LICENSE)). The OSS CLI is and will remain MIT-licensed.
+The hosted SaaS layer (Confluence/Notion publishing, dashboard, audit log) is proprietary.

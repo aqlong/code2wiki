@@ -1,0 +1,29 @@
+{
+  "contentHash": "f76a0538949cb2a503aec81a116b6af62e87563777baaaf718199e32a27a9cd8",
+  "managedBlockHash": "ee92ae05428fa6ffa6e0869cd4539f0af2c921fcb67fb88a315a08df17bfaab2",
+  "frontmatterKeys": [
+    "actor",
+    "code2wiki_id",
+    "confidence",
+    "last_commit",
+    "last_generated",
+    "slug",
+    "source_files",
+    "status",
+    "tags",
+    "title"
+  ],
+  "sections": [
+    "Summary",
+    "Actor and triggers",
+    "Preconditions",
+    "Main flow",
+    "Alternate and exception flows",
+    "Postconditions",
+    "Business rules",
+    "Suggested test scenarios",
+    "Related use cases",
+    "Source links"
+  ],
+  "bodyLineCount": 74
+}
