@@ -4,6 +4,8 @@
 
 **Status:** Working CLI MVP. End-to-end pipeline operational against real legacy CFML and Java repositories. Hosted SaaS layer (auto-publish to Confluence / Notion) coming next.
 
+I write about the engineering behind this at [aaronlongnion.substack.com](https://aaronlongnion.substack.com).
+
 
 ## What this is
 
