@@ -41,8 +41,12 @@ export type AuditOperation =
   // `apps/dashboard/scripts/calibration-recompute.ts` via the GHA
   // workflow after the data gate (N >= 100 edit-back observations,
   // all three confidence buckets non-empty) is met. Details carry
-  // serialisedModel, nObservations, brierScore, scopeType,
-  // calibrationId, and promptVersion.
+  // calibrationId, nObservations, brierScore, scopeType (currently
+  // "global", reserved for D6 per-customer scope), promptVersion (or
+  // null when the CLI was invoked without --prompt-version), and
+  // modelVersion (the serialised-model schema version; full model
+  // body lives in confidence_calibration, not the audit log).
+  // Contract pinned by recompute-cli.test.ts buildCalibrationAuditDetails.
   | "calibration_recomputed";
 
 export type AuditOutcome =
@@ -240,8 +244,14 @@ function sha256Hex(s: string): string {
 
 /** Stable JSON: keys sorted, undefined-valued keys dropped (matching
  *  JSON.stringify's serialization), no whitespace. Required for
- *  reproducible hashes that survive write-then-parse round-trips. */
-function canonicalJson(value: unknown): string {
+ *  reproducible hashes that survive write-then-parse round-trips.
+ *
+ *  Exported so any external audit verifier (and the v2 signing slice)
+ *  can canonicalise byte-exactly without reimplementing the contract.
+ *  Pairs with the already-exported {@link computeEntryHash}: the
+ *  hash is sha256("sha256:" prefix) of the canonicalJson output, and
+ *  both must agree to reproduce a known entry's hash. */
+export function canonicalJson(value: unknown): string {
   if (value === undefined) return "null"; // unreachable for top-level; safety
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) {

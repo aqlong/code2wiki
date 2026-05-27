@@ -4,8 +4,7 @@
 
 **Status:** Working CLI MVP. End-to-end pipeline operational against real legacy CFML and Java repositories. Hosted SaaS layer (auto-publish to Confluence / Notion) coming next.
 
-I write about the engineering behind this at [aaronlongnion.substack.com](https://aaronlongnion.substack.com).
-
+> **For hosted-dashboard customers, start here: [docs/getting-started.md](docs/getting-started.md).** The README below is the OSS CLI documentation; the hosted product has a different workflow (GitHub App, Sync-now button, in-app credential connections).
 
 ## What this is
 
@@ -22,7 +21,7 @@ Unlike developer-facing doc tools (Mintlify, Swimm, DeepWiki) and unlike enterpr
 
 ```bash
 # 1. Install dependencies and build
-git clone https://github.com/aqlong/code2wiki.git
+git clone https://github.com/craftandship/code2wiki.git
 cd code2wiki
 npm install
 npm run build
@@ -157,6 +156,14 @@ code2wiki/
 ├── package.json
 ├── tsconfig.json
 ├── vitest.config.ts
+├── docs/                        # strategy + product specs
+│   ├── vision.md
+│   ├── architecture.md
+│   ├── usecase-template.md
+│   ├── competitive-analysis.md
+│   ├── roadmap.md
+│   ├── pricing.md
+│   └── decisions.md             # ADR log
 ├── src/
 │   ├── cli/                     # commander entry + commands
 │   ├── core/                    # extraction engine
@@ -171,11 +178,21 @@ code2wiki/
 │   │   └── util/                # slug, lines
 │   └── index.ts                 # library entry
 ├── examples/                    # gold-standard demos + regression fixtures
-├── scripts/                     # dev utilities (snapshots, prompt-test)
-├── tools/                       # local dashboard, check-key, pr-summary
 ├── references/                  # cloned demo codebases (gitignored)
 └── .github/workflows/           # CI + auto-regenerate
 ```
+
+## Roadmap
+
+See [`docs/roadmap.md`](docs/roadmap.md). Status:
+
+- ✅ **Week 1**, CFML + Java parser + first real-app demos + tests + CI
+- ✅ **Week 2**, Hosted dashboard at [`apps/dashboard/`](apps/dashboard/). Next.js 15 + Auth.js (GitHub OAuth) + Drizzle/Postgres + GitHub-App webhook handler + Octokit-driven worker (real `git clone --depth=1` against installation tokens) + run-trigger route + repo-list and audit-log dashboard surfaces + `railway.toml` deploy config. The operator step (provision Railway + register the GitHub App + paste credentials) is in [`apps/dashboard/SETUP.md`](apps/dashboard/SETUP.md). Stripe billing moved to Week 4 with design-partner onboarding.
+- ✅ **Week 3**, Confluence + Notion publishers (CLI version)
+- ⏳ **Week 4**, 5 warm-network design partners (ADR-016 coexistence prerequisite ✅ shipped)
+- ✅ **Week 6**, Diff-aware regen + hash-chained audit log
+- ⏳ **Week 7**, Adobe ColdFusion forum + Ortus Solutions outreach
+- ⏳ **Week 8**, Public launch
 
 ## Development
 

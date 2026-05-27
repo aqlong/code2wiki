@@ -25,7 +25,7 @@ import type { Candidate } from "../types.js";
  *   4. Optionally `code2wiki replay` against a stable corpus to see the
  *      semantic delta before shipping
  */
-export const PROMPT_VERSION = "v4" as const;
+export const PROMPT_VERSION = "v20" as const;
 
 /**
  * The system prompt that anchors the LLM in our specific output schema.
@@ -76,7 +76,7 @@ CRITICAL RULES:
 - If you are uncertain, mark confidence "low" and explain why; do not invent business meaning that is not in the code.
 
 ACTOR: IDENTIFY THE BROADEST POSSIBLE CALLER:
-- For HTTP endpoints, look for ANY authentication or authorization annotations on the method, the class, or referenced filters/middleware. If there are NONE, the actor MUST be described as including unauthenticated visitors or anonymous users.
+- For HTTP endpoints, look for ANY authentication or authorization annotations on the method, the class, or referenced filters/middleware. Auth constraints also appear in the Parser hints "Notes" field: patterns like "auth: Secured, RolesAllowed" (Java/JEE), "auth: Authorize" (C#), "roles: admin,manager" (CFML), or "before_action: :authenticate_user!" (Ruby) are auth guards extracted by the parser. Treat these the same as explicit annotations. If there are NO annotations AND no auth-related Notes, the actor MUST be described as including unauthenticated visitors or anonymous users.
 - Do not default to "staff member" or "admin" unless the code or configuration actually restricts access to them.
 - When in doubt about access, frame the actor as the SUPERSET (e.g. "Visitor or staff member") rather than guessing the intended user.
 - For non-HTTP code (CFML component methods, background jobs, service classes), do NOT fall back to "internal service" or "internal caller." Instead, infer the actor from the function's domain and name. A publish/deploy method in a publisher or deployment component is invoked by an administrator or a scheduled deployment job; a processPayment method is invoked by a checkout workflow; a sendWelcomeEmail method is triggered by a user registration event. Name the real-world role that has the authority and context to invoke this function, not the technical layer.
@@ -84,6 +84,15 @@ ACTOR: IDENTIFY THE BROADEST POSSIBLE CALLER:
 BLAST RADIUS: SURFACE THE SCOPE OF SIDE EFFECTS:
 - For every database write, file write, cache invalidation, event/notification, or environment-mutating operation, ask: does this affect ONLY the immediate target, or does it also affect other entities, users, sites, tenants, or services?
 - Look for patterns that suggest broad blast radius: writes to tables/keys without a tenant or scope filter, "global" or "all" prefixed identifiers, cache flushes without a key, application-scope reloads.
+- Side effects appear pre-extracted in the Parser hints "Notes" field. Every entry below is a high-blast-radius operation that MUST appear in business_rules, main_flow steps, or postconditions. Do NOT silently drop them; they are the highest-value compliance signals.
+  - EMAIL: "Sends email", "Sends email (cfmail)", "Sends email (ActionMailer)", "Sends email (Django mail)". Anything emailed to a user is unrecoverable once delivered.
+  - OUTBOUND HTTP: "Makes outbound HTTP request", "Makes outbound HTTP request (cfhttp)", "Makes outbound HTTP request (cfinvoke webservice)". Crosses a trust boundary; any external dependency is also an audit and ops surface.
+  - BACKGROUND WORK: "Enqueues background job", "Enqueues background job (cfthread)", "Publishes Spring application event", "Sends message to broker (JMS, AMQP, or Kafka)", "Sends message to broker (MassTransit / Azure Service Bus)", "Sends message to broker (Bunny / Karafka)", "Sends message to broker (Kombu / Pika)". The effect happens later and out of band; the documented function is the trigger.
+  - DATABASE TRANSACTIONS: "Executes database operations inside a transaction (cftransaction)", "Executes within a database transaction (@Transactional)", "Executes within a database transaction (TransactionTemplate)", "Executes within a database transaction" (C# / Ruby / Django). All writes inside the transaction succeed or fail together; surface this as an all-or-nothing business rule.
+  - STORED PROCEDURES: "Calls stored procedure(s): X" (CFML, names the proc), "Calls stored procedure" (Java JPA / JDBC / SimpleJdbcCall, C# ADO.NET / Dapper, Django cursor.callproc, Ruby exec_stored_procedure / connection.execute CALL or EXEC). Stored procs may have side effects invisible in the calling code (triggers, cross-table writes, audit logging in the DB).
+  - FILESYSTEM WRITES: "Writes to file system", "Writes to file system (cffile)". The function persists data to shared disk state (uploads, exports, log writes, generated reports). Compliance and ops readers care.
+  - CACHE MUTATIONS: "Mutates application cache", "Mutates application cache (@CacheEvict / @CachePut)", "Mutates application cache (cfcache)". Downstream callers may see stale data or extra database load. The variants "clear" / "removeAll" / "delete_pattern" / "delete_matched" affect every cached entry, not just one; flag those as especially broad blast radius.
+  - PROCESS EXECUTION: "Executes external process", "Executes external process (cfexecute)". Highest-blast-radius signal of all: spawns an OS process at the web server's privilege level. Classic command-injection vector and a major compliance flag. Name the command being invoked when visible in the code.
 - When the blast radius is broader than the immediate target, surface it as an EXPLICIT business rule with the word "all" (e.g. "This action reloads the application for all sites on the production server, not just the deployed one"). This is one of the highest-value findings to capture for compliance and operations.
 
 OUTPUT FORMAT:
@@ -98,7 +107,21 @@ export function buildUserPrompt(
   projectName: string,
 ): string {
   const hintsSummary = formatHints(candidate);
-  const fence = candidate.language === "cfml" ? "cfml" : "java";
+  // Map language to a highlight.js-compatible fence label so that the
+  // focus region and full-file context blocks render with correct syntax
+  // highlighting in `code2wiki preview` HTML output.
+  // "coldfusion" is the highlight.js alias for ColdFusion/CFML ("cfml" is
+  // not a registered language); "csharp" is correct for C# (not "java").
+  const fence =
+    candidate.language === "cfml"
+      ? "coldfusion"
+      : candidate.language === "python"
+        ? "python"
+        : candidate.language === "ruby"
+          ? "ruby"
+          : candidate.language === "csharp"
+            ? "csharp"
+            : "java";
 
   // Read the full file and include it as context. Cross-file business rules
   // (e.g. Spring @InitBinder on the class, validation annotations on
@@ -109,9 +132,16 @@ export function buildUserPrompt(
   try {
     const fullSource = fs.readFileSync(candidate.filePath, "utf-8");
     const lineCount = fullSource.split("\n").length;
+    // Skip when the focus region already covers the entire file (e.g. aspx-page
+    // and cfm page-level candidates where lineStart=1, lineEnd=totalLines).
+    // The "Full source file" block would be identical to "Focus region source",
+    // doubling token cost and making the "use the rest of the file" instruction
+    // meaningless since there is no "rest".
+    const spansWholeFile =
+      candidate.lineStart === 1 && candidate.lineEnd >= lineCount - 1;
     // Cap at ~3000 lines to keep token cost bounded; for larger files we'd
     // need smarter context selection (a future improvement).
-    if (lineCount <= 3000) {
+    if (!spansWholeFile && lineCount <= 3000) {
       fullFileSection = `## Full source file (for cross-region context)
 The function/region you are documenting is at lines ${candidate.lineStart}-${candidate.lineEnd}.
 Use the rest of the file ONLY to identify class-level annotations, @InitBinder,
@@ -134,8 +164,7 @@ ${fullSource}
 ## Kind: ${candidate.kind}
 
 ${hintsSummary ? `## Parser hints\n${hintsSummary}\n` : ""}
-${fullFileSection}
-## Focus region source
+${fullFileSection}## Focus region source
 
 \`\`\`${fence}
 ${candidate.source}
@@ -167,8 +196,17 @@ function formatHints(c: Candidate): string {
   if (c.hints.databaseTables?.length) {
     lines.push(`DB tables touched: ${c.hints.databaseTables.join(", ")}`);
   }
+  if (c.handlerNames?.length) {
+    lines.push(`Handler names: ${c.handlerNames.join(", ")}`);
+  }
   if (c.hints.notes?.length) {
-    lines.push(`Notes: ${c.hints.notes.join("; ")}`);
+    // Bullet-format notes so multi-note entries (auth + side effects + ORM
+    // calls + plugin events) stay parseable even when individual notes
+    // contain their own colons (e.g. "Calls stored procedure(s): sp_X").
+    // BLAST RADIUS (v7) explicitly tells the LLM to read every Notes entry;
+    // bullets make that scan reliable across long lists.
+    const bullets = c.hints.notes.map((n) => `- ${n}`).join("\n");
+    lines.push(`Notes:\n${bullets}`);
   }
   return lines.join("\n");
 }

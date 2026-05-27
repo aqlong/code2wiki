@@ -22,5 +22,17 @@ export async function runList(opts: { cwd: string }): Promise<void> {
       `  ${c.language.padEnd(4)} ${c.kind.padEnd(20)} ${c.name}${route}`,
     );
     console.log(`       ${c.relativePath}:${c.lineStart}-${c.lineEnd}`);
+    if (c.companionFile) {
+      const handlers = c.handlerNames?.join(", ") ?? "";
+      console.log(
+        `       companion: ${c.companionFile}${handlers ? `  handlers: ${handlers}` : ""}`,
+      );
+    }
+    if (c.hints.databaseTables?.length) {
+      console.log(`       tables: ${c.hints.databaseTables.join(", ")}`);
+    }
+    if (c.hints.notes?.length) {
+      console.log(`       notes: ${c.hints.notes.join("; ")}`);
+    }
   }
 }

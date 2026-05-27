@@ -59,6 +59,21 @@ scratch/
 .scratch/
 TODO.local.md
 
+# Mutation-testing / sed -i.<suffix> debris. macOS BSD sed requires an
+# explicit backup-suffix arg after -i (unlike GNU sed where it's optional),
+# so reverse-validation workflows write the original file to e.g.
+# `src/core/audit.ts.tmp` or `tools/scripts/generate_git_state.py.b1`
+# while mutating the live source. The backup inherits the source mtime,
+# so it doesn't surface in editor "recently modified" pickers and slips
+# past pre-commit attention. Two incidents demonstrate distinct triggers:
+# audit.ts.tmp (f09475d, accidentally staged via `git add -A` during an
+# unrelated refactor) and generate_git_state.py.b1 (1818a70, mutation-
+# testing residue caught at iteration end). Ignoring these prevents
+# either failure mode from contaminating the commit again.
+*.tmp
+*.bak
+*.b1
+
 # Generated example output
 examples/*/generated/
 

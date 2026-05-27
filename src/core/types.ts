@@ -5,7 +5,7 @@ import { z } from "zod";
  * Language-agnostic: produced by every parser.
  */
 export interface Candidate {
-  language: "java" | "cfml" | "ruby" | "python" | "unknown";
+  language: "java" | "cfml" | "ruby" | "python" | "csharp" | "unknown";
   /** Absolute path to the source file. */
   filePath: string;
   /** Path relative to the project root (used in citations). */
@@ -17,6 +17,10 @@ export interface Candidate {
     | "controller-method" // HTTP handler in a Spring/JAX-RS controller
     | "rails-action" // Rails controller action (REST or custom route)
     | "django-view" // Django FBV or CBV HTTP handler
+    | "aspnet-action" // ASP.NET MVC / Web API action method
+    | "webforms-handler" // ASP.NET WebForms Page_Load / event handler
+    | "wcf-operation" // WCF [OperationContract] method
+    | "aspx-page" // .aspx / .ascx / .asax markup page
     | "function" // Plain function or method
     | "cf-tag-function" // <cffunction name=...>
     | "cf-script-function"; // function foo() { ... } in CFML script syntax
@@ -30,6 +34,31 @@ export interface Candidate {
    * Examples: HTTP method/path, parameter list, called functions, decorators.
    */
   hints: CandidateHints;
+  /**
+   * Relative path of a companion source file the orchestrator should pair
+   * with this candidate before invoking the LLM. Set by the .aspx markup
+   * parser to point at the sibling code-behind (e.g. "Default.aspx.cs").
+   * The pairing step itself lives in extractor.ts (D4 from the .NET parser
+   * planning note). Additive optional field; existing producers leave it
+   * undefined.
+   */
+  companionFile?: string;
+  /**
+   * Server-side event handler method names extracted from the markup.
+   * Used by the extractor to match this candidate against methods in the
+   * companion code-behind. Example: `<asp:Button OnClick="btnPay_Click" />`
+   * contributes "btnPay_Click". Additive optional field.
+   */
+  handlerNames?: string[];
+  /**
+   * Raw source of one or more companion files merged into this candidate by
+   * the orchestrator's pairing step (e.g. an .aspx markup candidate paired
+   * with its .aspx.cs code-behind). Populated by pairAspxCandidates() in
+   * extractor.ts; parsers do NOT set this. The `content` field is raw file
+   * text (no deindent / normalisation) so the LLM sees the file exactly as
+   * the developer wrote it. Additive optional field.
+   */
+  companionSources?: Array<{ path: string; content: string }>;
 }
 
 export interface CandidateHints {
@@ -199,6 +228,12 @@ export const ConfigSchema = z.object({
     "**/views.py",
     "**/*_views.py",
     "**/views/**/*.py",
+    "**/*.cs",
+    "**/*.aspx.cs",
+    "**/*.ascx.cs",
+    "**/*.aspx",
+    "**/*.ascx",
+    "**/*.asax",
   ]),
   /** Glob patterns to exclude. */
   exclude: z

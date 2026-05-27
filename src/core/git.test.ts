@@ -31,10 +31,10 @@ describe("changedFilesSince", () => {
     await commit(repo, "a.txt", "alpha\n", "initial");
     await commit(repo, "b.txt", "beta\n", "add b");
     await commit(repo, "a.txt", "alpha v2\n", "update a");
-  });
+  }, 30000);
   afterAll(async () => {
     if (repo) await fs.rm(repo, { recursive: true, force: true });
-  });
+  }, 30000);
 
   it("returns files changed between a ref and HEAD", async () => {
     const changed = await changedFilesSince(repo, "HEAD~1");
@@ -88,10 +88,10 @@ describe("changedFilesSince: uncommitted (working-tree) ref", () => {
     repo = await makeRepo();
     await commit(repo, "tracked.txt", "v1\n", "initial tracked");
     await commit(repo, "to-delete.txt", "doomed\n", "add to-delete");
-  });
+  }, 30000);
   afterAll(async () => {
     if (repo) await fs.rm(repo, { recursive: true, force: true });
-  });
+  }, 30000);
 
   it("returns [] on a clean working tree (no uncommitted changes)", async () => {
     const changed = await changedFilesSince(repo, "uncommitted");

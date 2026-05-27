@@ -383,14 +383,20 @@ describe("runAudit show (default action)", () => {
       content_hash: null,
       prev_hash: null,
     };
+    // Every documented AuditOutcome (src/core/audit.ts:48-63) gets a
+    // distinct printable symbol, including the three added with the
+    // retried + calibration_recomputed ops: `recovered`, `no_help`,
+    // `fitted`. The default-branch `?` is reserved for genuinely
+    // unknown values (forward-compat for a future enum extension).
     const outcomes: Array<[string, string]> = [
       ["created", "+"],
       ["updated", "~"],
       ["unchanged", "·"],
       ["skipped", "○"],
       ["error", "✗"],
-      ["recovered", "?"], // falls through to default
-      ["no_help", "?"], // falls through to default
+      ["recovered", "↻"],
+      ["no_help", "⊘"],
+      ["fitted", "⊕"],
       ["completely-unknown", "?"], // explicit default-branch probe
     ];
     const lines = outcomes.map(([outcome], i) => {
@@ -417,6 +423,90 @@ describe("runAudit show (default action)", () => {
     for (const [outcome] of outcomes) {
       expect(joined).toContain(`slug-${outcome}`);
     }
+  });
+
+  it("grows the operation column to the widest visible op (defends a stale magic-number pad)", async () => {
+    // Pins the per-render dynamic-pad calculation in runAudit. The
+    // historical hard-coded `.padEnd(9)` silently misaligned the table
+    // whenever a wider op landed (e.g. `regenerate-skip` at 15 or
+    // `calibration_recomputed` at 22). With dynamic pad-to-max, every
+    // row in a given render shares the same operation-column width;
+    // the test mixes a 7-char op (publish) with a 22-char op
+    // (calibration_recomputed) and asserts the short row pads up to
+    // match. A regression reverting to a static pad would render the
+    // short row with fewer than 15 trailing spaces.
+    const baseEntry: Omit<AuditEntry, "operation" | "outcome" | "page" | "entry_hash"> = {
+      timestamp: "2026-05-11T08:00:00.000Z",
+      commit: "abc1234",
+      details: undefined,
+      content_hash: null,
+      prev_hash: null,
+    };
+    const lines = [
+      JSON.stringify({
+        ...baseEntry,
+        operation: "publish",
+        outcome: "created",
+        page: "slug-short",
+        entry_hash: "sha256:dummy-0",
+      }),
+      JSON.stringify({
+        ...baseEntry,
+        operation: "calibration_recomputed",
+        outcome: "fitted",
+        page: "slug-long",
+        entry_hash: "sha256:dummy-1",
+      }),
+    ];
+    await writeRawAuditLines(dir, lines);
+
+    const { log } = captureConsole();
+    await runAudit({ cwd: dir, action: "show", limit: 10 });
+
+    const shortRow = log.find((s) => s.includes("slug-short"))!;
+    const longRow = log.find((s) => s.includes("slug-long"))!;
+    expect(shortRow).toBeDefined();
+    expect(longRow).toBeDefined();
+
+    // "publish" (7 chars) padded to 22 -> 15 trailing spaces before the page.
+    expect(shortRow).toMatch(/publish {15} slug-short/);
+    // "calibration_recomputed" (22 chars) takes the column at exact width:
+    // 0 trailing spaces, then the single separator-space before the page.
+    expect(longRow).toMatch(/calibration_recomputed slug-long/);
+  });
+
+  it("retains the historical pad-9 floor when only short ops are visible (no over-padding regression)", async () => {
+    // Defends a future "simplify the floor away" refactor that would
+    // collapse `Math.max(9, ...)` into a plain max. Short-op-only
+    // renders should preserve the historical 9-char column so existing
+    // operator habits (eyeball alignment of the page slug across short
+    // rows) survive.
+    await appendAuditEntry(dir, {
+      operation: "publish",
+      commit: "abc1",
+      page: "publishing-a-site",
+      outcome: "created",
+      now: () => "2026-05-11T08:00:00.000Z",
+    });
+    await appendAuditEntry(dir, {
+      operation: "manual",
+      commit: "abc2",
+      page: "manual-edit",
+      outcome: "updated",
+      now: () => "2026-05-11T09:00:00.000Z",
+    });
+
+    const { log } = captureConsole();
+    await runAudit({ cwd: dir, action: "show" });
+
+    const publishRow = log.find((s) => s.includes("publishing-a-site"))!;
+    const manualRow = log.find((s) => s.includes("manual-edit"))!;
+    expect(publishRow).toBeDefined();
+    expect(manualRow).toBeDefined();
+    // 7-char "publish" -> pad to 9 -> exactly 2 trailing spaces.
+    expect(publishRow).toMatch(/publish {2} publishing-a-site/);
+    // 6-char "manual" -> pad to 9 -> exactly 3 trailing spaces.
+    expect(manualRow).toMatch(/manual {3} manual-edit/);
   });
 });
 

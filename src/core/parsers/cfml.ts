@@ -152,8 +152,28 @@ function parseTagFunctions(
     const attrs = parseTagAttributes(match[1] ?? "");
     const fnName = attrs["name"] ?? "anonymous";
 
+    // access="private" methods are internal-only; callers outside the
+    // component cannot invoke them, so they are not user-facing actions.
+    const access = (attrs["access"] ?? "").toLowerCase();
+    if (access === "private") {
+      fnOpen.lastIndex = closeEnd;
+      continue;
+    }
+
     const lineStart = lineFromOffset(cleaned, openStart);
     const lineEnd = lineFromOffset(cleaned, closeEnd);
+    const tagHints = extractCfmlHints(block, "tag");
+    // access="remote" exposes the function over HTTP (CFML web-service
+    // remoting). Surface it so the LLM treats this as a user-facing endpoint.
+    if (access === "remote") {
+      tagHints.notes = ["access: remote (HTTP-callable via CFC remoting)", ...(tagHints.notes ?? [])];
+    }
+    // roles="admin,manager" restricts who can call the function (ColdFusion
+    // built-in access control). Surface it so the LLM can describe auth requirements.
+    const tagRoles = (attrs["roles"] ?? "").trim();
+    if (tagRoles) {
+      tagHints.notes = [...(tagHints.notes ?? []), `roles: ${tagRoles}`];
+    }
 
     out.push({
       language: "cfml",
@@ -164,7 +184,7 @@ function parseTagFunctions(
       lineStart,
       lineEnd,
       source: block,
-      hints: extractCfmlHints(block, "tag"),
+      hints: tagHints,
     });
 
     fnOpen.lastIndex = closeEnd;
@@ -205,9 +225,45 @@ function parseScriptFunctions(
     const fnKeywordIdx = cleaned.lastIndexOf("function", openParen);
     const start = fnKeywordIdx >= 0 ? fnKeywordIdx : match.index;
 
+    // Skip private functions: look back from the `function` keyword to the
+    // start of the statement (newline / semicolon / brace) and check for
+    // `private`. The regex match starts AFTER the access modifier token when
+    // a return type follows (e.g. `private string function`), so inspecting
+    // match[0] is not reliable; a lookback from fnKeywordIdx is.
+    const stmtScanFrom = fnKeywordIdx >= 0 ? fnKeywordIdx : match.index;
+    const lineBegin = cleaned.lastIndexOf("\n", stmtScanFrom) + 1;
+    const beforeKeyword = cleaned.slice(lineBegin, stmtScanFrom);
+    if (/\bprivate\b/i.test(beforeKeyword)) {
+      fnRegex.lastIndex = closeBrace + 1;
+      continue;
+    }
+
     const lineStart = lineFromOffset(cleaned, start);
     const lineEnd = lineFromOffset(cleaned, closeBrace + 1);
     const block = cleaned.slice(start, closeBrace + 1);
+    const scriptHints = extractCfmlHints(block, "script");
+
+    // Extract inline parameters from the function signature. Tag-style CFML
+    // uses <cfargument> tags (handled by extractCfmlHints); script-style uses
+    // `required string name` inline declarations that the <cfargument> regex
+    // cannot see. Only apply when extractCfmlHints found no <cfargument> tags
+    // (guards against legacy mixed-mode files that embed tags inside script).
+    if (!scriptHints.parameters?.length) {
+      const paramText = cleaned.slice(openParen + 1, closeParen);
+      const inlineParams = extractScriptStyleParams(paramText);
+      if (inlineParams.length > 0) scriptHints.parameters = inlineParams;
+    }
+
+    if (/\bremote\b/i.test(beforeKeyword)) {
+      scriptHints.notes = ["access: remote (HTTP-callable via CFC remoting)", ...(scriptHints.notes ?? [])];
+    }
+    // roles="admin,manager" may appear between the closing param-paren and the
+    // opening brace: `remote function foo() roles="admin" {`
+    const afterParen = cleaned.slice(closeParen + 1, openBrace);
+    const scriptRolesMatch = afterParen.match(/\broles\s*=\s*["']([^"']*)["']/i);
+    if (scriptRolesMatch?.[1]) {
+      scriptHints.notes = [...(scriptHints.notes ?? []), `roles: ${scriptRolesMatch[1].trim()}`];
+    }
 
     out.push({
       language: "cfml",
@@ -218,7 +274,7 @@ function parseScriptFunctions(
       lineStart,
       lineEnd,
       source: block,
-      hints: extractCfmlHints(block, "script"),
+      hints: scriptHints,
     });
 
     fnRegex.lastIndex = closeBrace + 1;
@@ -306,6 +362,71 @@ export function countExecutableLines(source: string): number {
     .filter((l) => l.trim().length > 0).length;
 }
 
+// --- script-style parameter extraction -----------------------------------
+
+// Built-in CFML simple types. First word of a param declaration matching
+// one of these (case-insensitive) is treated as the type; the next word
+// is the name. PascalCase first words are treated as component-type names.
+const CFML_BUILTIN_TYPES = new Set([
+  "any", "array", "binary", "boolean", "date", "guid", "numeric",
+  "query", "string", "struct", "uuid", "void", "xml", "integer", "float",
+]);
+
+/**
+ * Parse the raw text between the parentheses of a CFML script-style
+ * function declaration into structured parameter hints.
+ *
+ * Handles: `required string name`, `numeric age = 0`, `name`, `Config cfg`.
+ * Strips default values (depth-aware so `= {a: 1}` is handled correctly).
+ */
+function extractScriptStyleParams(
+  paramText: string,
+): Array<{ name: string; type?: string }> {
+  if (!paramText.trim()) return [];
+
+  // Split on commas at bracket depth 0 (defaults may contain {}, []).
+  const parts: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of paramText) {
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}") depth--;
+    if (ch === "," && depth === 0) { parts.push(current); current = ""; }
+    else current += ch;
+  }
+  parts.push(current);
+
+  const result: Array<{ name: string; type?: string }> = [];
+  for (const part of parts) {
+    // Strip default value from `=` onwards at depth 0.
+    let decl = "";
+    let d2 = 0;
+    for (const ch of part.trim()) {
+      if (ch === "(" || ch === "[" || ch === "{") d2++;
+      else if (ch === ")" || ch === "]" || ch === "}") d2--;
+      if (ch === "=" && d2 === 0) break;
+      decl += ch;
+    }
+    // Strip leading `required` keyword (case-insensitive).
+    decl = decl.trim().replace(/^required\s+/i, "").trim();
+    const words = decl.split(/\s+/).filter(Boolean);
+    if (words.length === 0) continue;
+
+    if (words.length === 1) {
+      result.push({ name: words[0]! });
+    } else {
+      const maybeType = words[0]!;
+      const maybeName = words[1]!;
+      // Treat as a type when it's a known CFML builtin or PascalCase (component).
+      const isType =
+        CFML_BUILTIN_TYPES.has(maybeType.toLowerCase()) ||
+        /^[A-Z]/.test(maybeType);
+      result.push(isType ? { name: maybeName, type: maybeType } : { name: words[words.length - 1]! });
+    }
+  }
+  return result;
+}
+
 // --- hint extraction -----------------------------------------------------
 
 function extractCfmlHints(
@@ -326,13 +447,49 @@ function extractCfmlHints(
   }
   if (params.length) hints.parameters = params;
 
-  // SQL table refs in <cfquery> blocks
-  const queryBlocks = block.match(/<cfquery[\s\S]*?<\/cfquery>/gi) ?? [];
+  // SQL table refs. Two sources, both common in production CFML:
+  //   1. <cfquery name="x">SELECT ... FROM ...</cfquery> tag form
+  //   2. queryExecute("SELECT ... FROM ...", ...) script form (Lucee + ACF 2018+)
+  // The script form is the modern idiom in ColdBox/ContentBox/MasaCMS code; the
+  // tag form remains common in legacy controllers. Missing the script form
+  // silently dropped database tables for an entire class of CFML codebases.
+  const sqlSources: string[] = [
+    ...(block.match(/<cfquery[\s\S]*?<\/cfquery>/gi) ?? []),
+  ];
+  // queryExecute(...) extracts the SQL string from the first argument. The
+  // string body may be double-quoted or single-quoted; multi-line literals
+  // work as-is because JS `[^"]` and `[^']` match newlines. Out of scope for
+  // this regex: string concatenation ("SELECT" & " ..."), variable references
+  // (`var sql = "..."; queryExecute(sql)`), and queries assembled from
+  // QueryBuilder fluent builders. Revisit when customer code surfaces them.
+  const queryExecuteMatches = block.matchAll(
+    /\bqueryExecute\s*\(\s*(?:"([^"]*)"|'([^']*)')/gi,
+  );
+  for (const m of queryExecuteMatches) {
+    const sql = m[1] ?? m[2] ?? "";
+    if (sql) sqlSources.push(sql);
+  }
   const tables = new Set<string>();
-  for (const q of queryBlocks) {
-    const matches = q.matchAll(/\b(?:from|update|into|join)\s+([a-zA-Z_][\w]*)/gi);
+  for (const q of sqlSources) {
+    // Capture the full qualified identifier after FROM/UPDATE/INTO/JOIN, then
+    // strip any wrapping brackets / backticks / double-quotes before keeping
+    // the last dotted segment. Handles four real-world forms:
+    //   - users                       (unqualified)
+    //   - dbo.Users                   (schema-qualified, Oracle / generic)
+    //   - [dbo].[Users]               (SQL Server bracketed)
+    //   - `users` / "users"           (MySQL backticks / Postgres doublequotes)
+    // The capture allows `[`, `]`, backtick, `"`, dot, and word chars. The
+    // post-processing strips quote chars and validates the remaining token is
+    // a clean identifier before adding to the table set.
+    const matches = q.matchAll(/\b(?:from|update|into|join)\s+([\w.[\]"`]+)/gi);
     for (const t of matches) {
-      if (t[1]) tables.add(t[1]);
+      if (!t[1]) continue;
+      const parts = t[1].split(".");
+      const last = parts[parts.length - 1] ?? "";
+      const tableName = last.replace(/[[\]"`]/g, "");
+      if (tableName && /^[a-zA-Z_]\w*$/.test(tableName)) {
+        tables.add(tableName);
+      }
     }
   }
   if (tables.size) hints.databaseTables = [...tables].slice(0, 20);
@@ -345,6 +502,18 @@ function extractCfmlHints(
     if (name.length < 3) continue;
     if (CFML_KEYWORDS.has(name.toLowerCase())) continue;
     callees.add(name);
+  }
+  // Legacy CFML invokes methods via <cfinvoke method="X" ...>. The method name
+  // is in an attribute, not followed by `(`, so the bare callee regex above
+  // misses it entirely. Common in older ContentBox / MasaCMS / framework code,
+  // exactly the target market for code2wiki.
+  const cfinvokeMatches = block.matchAll(
+    /<cfinvoke\b[^>]*\bmethod\s*=\s*["']([^"']+)["']/gi,
+  );
+  for (const inv of cfinvokeMatches) {
+    if (inv[1] && !CFML_KEYWORDS.has(inv[1].toLowerCase())) {
+      callees.add(inv[1]);
+    }
   }
   if (callees.size) hints.callees = [...callees].slice(0, 30);
 
@@ -414,6 +583,162 @@ function extractCfmlHints(
     ];
   }
 
+  // Notes: email sending (cfmail tag or function). Surfaced as an explicit side
+  // effect because sending email is high-blast-radius: it may reach customers or
+  // external stakeholders and cannot be undone after the fact.
+  if (/<cfmail\b/i.test(block) || /\bcfmail\s*\(/i.test(block)) {
+    hints.notes = [
+      ...(hints.notes ?? []),
+      "Sends email (cfmail)",
+    ];
+  }
+
+  // Notes: outbound HTTP calls (cfhttp tag or function). Surfaced as a side effect
+  // because external calls introduce latency, auth dependencies, and blast radius
+  // beyond the current server.
+  if (/<cfhttp\b/i.test(block) || /\bcfhttp\s*\(/i.test(block)) {
+    hints.notes = [
+      ...(hints.notes ?? []),
+      "Makes outbound HTTP request (cfhttp)",
+    ];
+  }
+  // Notes: SOAP web service invocations. Three CFML forms all make outbound
+  // HTTP calls to a WSDL/SOAP endpoint and are audit-equivalent to cfhttp:
+  //   1. <cfinvoke webservice="http://api/service?wsdl" method="...">
+  //      Tag form, extremely common in pre-2010 ColdFusion enterprise code.
+  //   2. CreateObject("webservice", "http://api/service?wsdl")
+  //      Script / function form; used in CFScript blocks and modern .cfc files.
+  //   3. <cfobject type="webservice" name="svc" webservice="http://...">
+  //      Two-step proxy form from ColdFusion MX (6.x/7.x, 2002-2008). Creates
+  //      a local proxy variable; the outbound SOAP call happens when cfobject
+  //      resolves the WSDL. Less common after cfinvoke was preferred but still
+  //      widespread in MasaCMS / ContentBox era legacy code.
+  // The `webservice` attribute/argument is the discriminating signal -- a plain
+  // <cfinvoke component="LocalCFC"> or <cfobject type="java"> does NOT trigger.
+  if (
+    /<cfinvoke\b[^>]*\bwebservice\s*=/i.test(block)
+    || /\bCreateObject\s*\(\s*["']webservice["']/i.test(block)
+    || /<cfobject\b[^>]*\btype\s*=\s*["']webservice["']/i.test(block)
+  ) {
+    hints.notes = [
+      ...(hints.notes ?? []),
+      "Makes outbound HTTP request (cfinvoke webservice)",
+    ];
+  }
+
+  // Notes: background thread dispatch via cfthread. CFML's cfthread tag and
+  // function both accept an `action` attribute/argument; only action="run"
+  // actually spawns a new thread. The parent request returns immediately while
+  // the thread body executes concurrently -- the canonical CFML fire-and-forget
+  // pattern used for async email, report generation, and third-party API calls.
+  // action="join" (wait), "sleep" (pause), and "terminate" (kill) do NOT start
+  // background work and are intentionally NOT flagged.
+  // Two forms:
+  //   1. Tag form:       <cfthread action="run" name="t1"> ... </cfthread>
+  //   2. Function form:  cfthread(action="run", name="t1") { ... }
+  // Closes the background-job matrix: Java (@Async / CompletableFuture),
+  // C# (Hangfire BackgroundJob.Enqueue), Ruby (perform_later / perform_async),
+  // Django (Celery .delay / .apply_async) all emit the same note.
+  if (
+    /<cfthread\b[^>]*\baction\s*=\s*["']run["']/i.test(block)
+    || /\bcfthread\s*\([^)]*\baction\s*=\s*["']run["']/i.test(block)
+  ) {
+    hints.notes = [
+      ...(hints.notes ?? []),
+      "Enqueues background job (cfthread)",
+    ];
+  }
+
+  // Notes: cache mutation. cachePut / cacheRemove / cacheRemoveAll / cacheClear
+  // are the CFML function-form cache API; <cfcache action="flush|put"> is the
+  // tag form. Cache reads (cacheGet, cacheGetMetadata, cacheKeyExists,
+  // cacheCount) are intentionally NOT flagged: no blast radius beyond a cache
+  // miss. Closes the cache-mutation matrix opened by Java @CacheEvict, C#
+  // IMemoryCache, Ruby Rails.cache, and Django cache.X.
+  if (
+    /\bcache(?:Put|Remove|RemoveAll|Clear)\s*\(/i.test(block)
+    || /<cfcache\b[^>]*\baction\s*=\s*["'](?:flush|put)["']/i.test(block)
+  ) {
+    hints.notes = [
+      ...(hints.notes ?? []),
+      "Mutates application cache (cfcache)",
+    ];
+  }
+
+  // Notes: filesystem mutations (cffile / fileWrite / fileDelete / fileUpload).
+  // Writing, deleting, moving, or uploading files affects shared disk state and
+  // is audit-relevant for compliance. Reads (cffile action="read", fileRead)
+  // are intentionally NOT flagged since they have no blast radius.
+  const cffileTagRe = /<cffile\b[^>]*\baction\s*=\s*["'](?:write|upload|uploadall|append|delete|move|rename|copy)["']/gi;
+  const cffileFnRe = /\b(?:fileWrite|fileAppend|fileDelete|fileMove|fileCopy|fileUpload|fileUploadAll)\s*\(/gi;
+  if (cffileTagRe.test(block) || cffileFnRe.test(block)) {
+    hints.notes = [
+      ...(hints.notes ?? []),
+      "Writes to file system (cffile)",
+    ];
+  }
+
+  // Notes: external process execution. Adobe CF and Lucee expose one primitive
+  // for spawning OS processes: cfexecute. Audit-critical because the spawned
+  // process inherits server privileges; common in ColdFusion shops for PDF
+  // generation (wkhtmltopdf), image conversion (ImageMagick / GraphicsMagick),
+  // and legacy CLI integration. Closes the process-execution matrix opened by
+  // Java Runtime.exec / ProcessBuilder, C# Process.Start / Cli.Wrap, Ruby
+  // system / Open3, and Django subprocess / os.system. Two forms:
+  //   1. Tag form:        <cfexecute name="..." ...>
+  //   2. Function form:   cfexecute(name="...", ...)
+  if (/<cfexecute\b/i.test(block) || /\bcfexecute\s*\(/i.test(block)) {
+    hints.notes = [
+      ...(hints.notes ?? []),
+      "Executes external process (cfexecute)",
+    ];
+  }
+
+  // Notes: database transactions. Critical for auditors: all database operations
+  // inside the block succeed or fail together (all-or-nothing). Recognises both
+  // tag form (`<cftransaction>`) and the two script-style forms used in
+  // ColdBox, ContentBox, and Wheels migrations: `transaction { ... }` block
+  // syntax and `transaction action="commit";` statement syntax. The
+  // `(?:\{|action\s*=)` suffix is what filters out look-alikes like
+  // `local.transaction = ...` (assignment) and `log.transaction(...)` (call).
+  const hasTransaction =
+    /<cftransaction\b/i.test(block) ||
+    /\btransaction\s*(?:\{|action\s*=)/i.test(block) ||
+    /\bcftransaction\s*\(/i.test(block);
+  if (hasTransaction) {
+    hints.notes = [
+      ...(hints.notes ?? []),
+      "Executes database operations inside a transaction (cftransaction)",
+    ];
+  }
+
+  // Notes: stored procedure calls (cfstoredproc). Stored procs may have
+  // side effects invisible in the ColdFusion code (e.g. triggers, cross-table
+  // writes, audit logging in the DB layer). Three forms in the wild:
+  //   1. Tag form:        <cfstoredproc procedure="sp_X" ...>
+  //   2. Script block:    storedproc procedure="sp_X" ... { ... }    (Lucee, ACF 2018+)
+  //   3. Function call:   cfstoredproc(procedure="sp_X", ...)
+  const storedProcs: string[] = [];
+  const storedProcPatterns = [
+    /<cfstoredproc\b[^>]*\bprocedure\s*=\s*["']([^"']+)["']/gi,
+    /\bstoredproc\b[^{]*?\bprocedure\s*=\s*["']([^"']+)["']/gi,
+    /\bcfstoredproc\s*\(\s*[^)]*?\bprocedure\s*=\s*["']([^"']+)["']/gi,
+  ];
+  for (const re of storedProcPatterns) {
+    let spMatch: RegExpExecArray | null;
+    while ((spMatch = re.exec(block)) !== null) {
+      if (spMatch[1] && !storedProcs.includes(spMatch[1])) {
+        storedProcs.push(spMatch[1]);
+      }
+    }
+  }
+  if (storedProcs.length > 0) {
+    hints.notes = [
+      ...(hints.notes ?? []),
+      `Calls stored procedure(s): ${storedProcs.join(", ")}`,
+    ];
+  }
+
   return hints;
 }
 
@@ -476,47 +801,36 @@ function matchingBrace(s: string, openIdx: number): number {
 }
 
 const CFML_KEYWORDS = new Set([
-  "if",
-  "else",
-  "for",
-  "while",
-  "switch",
-  "case",
-  "do",
-  "function",
-  "return",
-  "var",
-  "local",
-  "and",
-  "or",
-  "not",
-  "true",
-  "false",
-  "len",
-  "isdate",
-  "isnull",
-  "isvalid",
-  "structkeyexists",
-  "arraylen",
-  "arraynew",
-  "structnew",
-  "querynew",
-  "createobject",
-  "createodbcdatetime",
-  "createdate",
-  "now",
-  "trim",
-  "lcase",
-  "ucase",
-  "left",
-  "right",
-  "mid",
-  "find",
-  "listfindnocase",
-  "listfind",
-  "listappend",
-  "listgetat",
-  "listlen",
-  "fileexists",
-  "directoryexists",
+  // Control flow.
+  "if", "else", "for", "while", "switch", "case", "do",
+  "function", "return", "var", "local",
+  "and", "or", "not", "true", "false",
+  // Length / existence / validation (low business-collision).
+  "len", "isdate", "isnull", "isvalid",
+  // Struct / array / query constructors and accessors.
+  "structkeyexists", "arraylen", "arraynew", "structnew", "querynew",
+  // Component / object instantiation.
+  "createobject", "createodbcdatetime", "createdate",
+  // String case + slicing (CFML stdlib forms).
+  "trim", "lcase", "ucase", "left", "right", "mid", "find",
+  // List operations.
+  "listfindnocase", "listfind", "listappend", "listgetat", "listlen",
+  // File system.
+  "fileexists", "directoryexists",
+  // Date functions: extremely common in CFML business code, never business names.
+  "now", "dateformat", "dateadd", "datediff", "datepart", "datecompare",
+  "parsedatetime", "lsparsedate", "lsdateformat", "lstimeformat",
+  "timeformat", "numberformat",
+  // Regex + advanced string (rereplace/rereplacenocase are CFML-specific).
+  "rereplace", "rereplacenocase",
+  // JSON serialization (always stdlib).
+  "serializejson", "deserializejson",
+  // URL / HTML / XML escaping (always stdlib).
+  "urlencodedformat", "urldecode", "htmleditformat", "xmlformat",
+  // Param / metadata helpers (never business names).
+  "paramexists", "getmetadata", "gettickcount", "valueof",
+  // CFScript-equivalent expression helpers (rarely business names).
+  "iif", "evaluate",
+  // CFML's logging function form.
+  "writelog",
 ]);

@@ -1,5 +1,19 @@
 import { defineConfig } from "vitest/config";
 
+// Root vitest runs the CLI test suite ONLY. Sub-packages with their own
+// dependencies (apps/dashboard, tools/ocean-bot, tools/ocean-bot/dashboard)
+// have their own vitest.config.ts + their own CI step that installs their
+// deps. Including their test files here causes "Failed to load url <pkg>"
+// errors at root because the sub-package node_modules are not in the root
+// npm tree. See .github/workflows/ci.yml for the per-package steps.
+//
+// History: 2026-05-21 CI went red on every commit because
+// `tools/ocean-bot/**/*.test.ts` was incorrectly listed in the include
+// pattern, pulling in 14 test files whose imports (drizzle-orm, react,
+// playwright, next/server, next-auth/providers/github) only resolve under
+// the bot's own node_modules. Fix: drop the include + add sub-package dirs
+// to exclude as defense-in-depth against future include-glob widening.
+
 export default defineConfig({
   test: {
     globals: false,
@@ -11,7 +25,15 @@ export default defineConfig({
       // like CODE2WIKI_PUBLISHER_SMOKE_URL; skipped cleanly otherwise).
       "tests/**/*.test.ts",
     ],
-    exclude: ["node_modules", "dist", "references"],
-    testTimeout: 10000,
+    exclude: [
+      "**/node_modules/**",
+      "dist",
+      "references",
+      // Sub-packages run their own tests via dedicated CI steps; do not
+      // crawl them from the root run.
+      "apps/**",
+      "tools/ocean-bot/**",
+    ],
+    testTimeout: 30000,
   },
 });

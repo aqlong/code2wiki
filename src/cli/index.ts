@@ -54,8 +54,16 @@ program
   .option("--name <name>", "Only include the candidate with this exact function/method name (suffix match, e.g. 'publish' or 'OwnerController.processCreationForm')")
   .option("--since <ref>", "Only regenerate candidates whose source files changed since this git ref (e.g. 'HEAD~1', 'main', 'origin/main', or 'uncommitted')")
   .option("--estimate-cost", "Project token + USD cost via anthropic.messages.countTokens (non-billed) and exit without LLM calls. Requires ANTHROPIC_API_KEY.", false)
-  .action(async (opts: { cwd: string; mock: boolean; limit?: number; only?: string; name?: string; since?: string; estimateCost?: boolean }) => {
-    await runGenerate(opts);
+  .option(
+    "--min-confidence <level>",
+    "Skip writing pages whose LLM-rated confidence is below this level. One of: high, medium, low (default: low = write everything).",
+  )
+  .action(async (opts: { cwd: string; mock: boolean; limit?: number; only?: string; name?: string; since?: string; estimateCost?: boolean; minConfidence?: string }) => {
+    const { minConfidence, ...rest } = opts;
+    await runGenerate({
+      ...rest,
+      minConfidence: minConfidence as "high" | "medium" | "low" | undefined,
+    });
   });
 
 program

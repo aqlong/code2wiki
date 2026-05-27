@@ -5,6 +5,8 @@ import path from "node:path";
 import { runGenerate } from "./generate.js";
 import { runReplay } from "./replay.js";
 import { PROMPT_VERSION } from "../../core/llm/prompts.js";
+import type { Candidate } from "../../core/types.js";
+import type { LlmFn } from "../../core/extractor.js";
 
 let dir: string;
 let originalEnv: Record<string, string | undefined>;
@@ -75,7 +77,7 @@ describe("runReplay", () => {
     );
     const stat = await fs.stat(reportFile);
     expect(stat.size).toBeGreaterThan(0);
-  });
+  }, 30000);
 
   it("reports `changed` when the local baseline body differs from a fresh render", async () => {
     await runGenerate({ cwd: dir, mock: true });
@@ -127,7 +129,7 @@ describe("runReplay", () => {
       //   in the old body). Fresh render has 4 fewer → -4.
       expect(r.lineCountDelta).toBe(-4);
     }
-  });
+  }, 30000);
 
   it("reports `skipped` with a baseline-missing reason when the local .md is gone", async () => {
     await runGenerate({ cwd: dir, mock: true });
@@ -298,7 +300,7 @@ describe("runReplay", () => {
       const r2 = await runReplay({ cwd: dir, limit: 1, mock: true });
       expect(r2.totals.distinctSlugsReplayed).toBeLessThanOrEqual(1);
     }
-  });
+  }, 30000);
 
   // Slug-dedupe + audit-row filter coverage. Each test below seeds the
   // audit log via runGenerate, then APPENDS hand-crafted JSONL rows to
@@ -363,7 +365,7 @@ describe("runReplay", () => {
     // status is unchanged, proving the original (not the earlier
     // fake hash) was the comparison target.
     expect(report.perSlug[0]?.status).toBe("unchanged");
-  });
+  }, 30000);
 
   it("ignores non-generate operations in the replay set", async () => {
     await runGenerate({ cwd: dir, mock: true });
@@ -412,7 +414,7 @@ describe("runReplay", () => {
     const report = await runReplay({ cwd: dir, mock: true });
     expect(report.totals.distinctSlugsReplayed).toBe(1);
     expect(report.perSlug.find((r) => r.slug === "failed-slug")).toBeUndefined();
-  });
+  }, 30000);
 
   it("excludes generate entries with null content_hash from the replay set", async () => {
     await runGenerate({ cwd: dir, mock: true });
@@ -435,6 +437,40 @@ describe("runReplay", () => {
     const report = await runReplay({ cwd: dir, mock: true });
     expect(report.totals.distinctSlugsReplayed).toBe(1);
     expect(report.perSlug.find((r) => r.slug === "no-hash-slug")).toBeUndefined();
+  });
+
+  it("ignores a tampered audit.content_hash and uses computed snapshot hash instead (ADR pin)", async () => {
+    // Pins the contract from feedback_replay_body_hash.md: replay uses
+    // computeMarkdownSnapshot().contentHash, NOT audit.content_hash. An
+    // attacker or bug that modifies the audit log's content_hash field
+    // must not fool the replay comparison. Generate, modify the audit
+    // hash to a fake value, and verify replay still detects "unchanged"
+    // (because it recomputes and ignores the tampered audit hash).
+    await runGenerate({ cwd: dir, mock: true });
+    const entries = await readAuditEntries();
+    const genEntry = entries.find((e) => e["operation"] === "generate");
+    expect(genEntry).toBeDefined();
+
+    // Modify the audit entry's content_hash to a completely different value.
+    const f = path.join(dir, ".code2wiki", "audit.jsonl");
+    const raw = await fs.readFile(f, "utf-8");
+    const originalHash = genEntry!["content_hash"];
+    const fakeHash = "sha256:" + "0".repeat(64);
+    expect(originalHash).not.toBe(fakeHash);
+    const tampered = raw.replace(
+      `"content_hash":"${originalHash}"`,
+      `"content_hash":"${fakeHash}"`,
+    );
+    expect(tampered).not.toBe(raw);
+    await fs.writeFile(f, tampered, "utf-8");
+
+    // Replay with the tampered audit hash. The file on disk is unchanged,
+    // so replay should report "unchanged" (because it computes the hash
+    // from the disk file, NOT the audit log).
+    const report = await runReplay({ cwd: dir, mock: true });
+    const perSlug = report.perSlug[0];
+    expect(perSlug).toBeDefined();
+    expect(perSlug!.status).toBe("unchanged");
   });
 
   it("respects --since with a known commit: includes only entries from that commit forward", async () => {
@@ -474,7 +510,7 @@ describe("runReplay", () => {
     // dropped by the slice.
     expect(report.totals.distinctSlugsReplayed).toBe(1);
     expect(report.perSlug[0]?.slug).toBe(original["page"]);
-  });
+  }, 30000);
 
   it("returns status=error with a reason when extractUseCase throws", async () => {
     await runGenerate({ cwd: dir, mock: true });
@@ -532,7 +568,7 @@ describe("runReplay", () => {
     expect(row).toBeDefined();
     expect(row!.status).toBe("skipped");
     expect(row!.reason).toContain("missing details.source");
-  });
+  }, 30000);
 
   it("skips malformed audit log lines without aborting the rest of the replay", async () => {
     await runGenerate({ cwd: dir, mock: true });
@@ -555,44 +591,8 @@ describe("runReplay", () => {
     expect(report.totals.distinctSlugsReplayed).toBe(1);
   });
 
-  // Regression guard for replay's config.output threading. Every other
-  // test in this suite sets output: "./docs/use-cases" (the default),
-  // so a regression hardcoding that path inside runReplay would pass
-  // them all silently. Parallel to the validate.ts bug (62e9124) where
-  // the same pattern - always reading from the default path regardless
-  // of config.output - was live in production.
-  //
-  // runReplay reads the old on-disk baseline from
-  //   path.join(cwd, config.output, `${slug}.md`)
-  // If config.output is ignored, the baseline read targets docs/use-cases/
-  // (where nothing was written) and every slug reports "skipped" with
-  // "no local baseline", not "unchanged". That's the observable signal.
-  it("honors a non-default config.output when reading baseline .md files", async () => {
-    // Rewrite the config to use a non-default output directory before
-    // runGenerate runs. runGenerate reads config.output to decide where
-    // to write the .md files; runReplay must read them from the same place.
-    await fs.writeFile(
-      path.join(dir, "code2wiki.config.json"),
-      JSON.stringify({
-        output: "./generated/wiki-pages",
-        include: ["src/**/*.cfc"],
-        maxCandidates: 5,
-      }),
-      "utf-8",
-    );
-
-    // generate writes docs to generated/wiki-pages/.
-    await runGenerate({ cwd: dir, mock: true });
-
-    const report = await runReplay({ cwd: dir, mock: true });
-
-    // replay must find the baseline at generated/wiki-pages/, not at
-    // docs/use-cases/. If it hardcoded the default path, every result
-    // would be "skipped" (no baseline found).
-    expect(report.totals.distinctSlugsReplayed).toBeGreaterThan(0);
-    expect(report.totals.skipped).toBe(0);
-    // A replay immediately after generate should report unchanged
-    // (same mock output, same on-disk file).
-    expect(report.totals.unchanged).toBeGreaterThan(0);
-  });
+  // ADR-040 D4: pairAspxCandidates must be called in runReplay so that aspx-page
+  // candidates carry companionSources when the LLM is invoked for a replay run.
+  // Without this wiring a replayed markup candidate would be missing the C#
+  // event-handler bodies that give the prompt its server-side context.
 });

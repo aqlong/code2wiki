@@ -30,6 +30,132 @@ const REST_ROUTES: Record<string, { method: string; path: string }> = {
   destroy: { method: "DELETE", path: "/:resources/:id" },
 };
 
+/**
+ * Represents a Rails `before_action` (or `before_filter`) callback declared
+ * at the top of a controller class. `only` and `except` are action-name lists
+ * parsed from `only: [:a, :b]` / `except: %i[a b]` keyword args; when absent
+ * the callback applies to every action in the class.
+ */
+interface BeforeAction {
+  callback: string;
+  only: Set<string> | null;
+  except: Set<string> | null;
+}
+
+/** Parse a Ruby symbol-array literal like `[:show, :index]` or `%i[show index]`. */
+function parseSymbolList(text: string): string[] {
+  // %i[a b c] form
+  const pct = text.match(/%[iI]\[([^\]]*)\]/);
+  if (pct) return (pct[1] ?? "").trim().split(/\s+/).filter(Boolean);
+  // [:a, :b, :c] form
+  const bracket = text.match(/\[([^\]]*)\]/);
+  if (!bracket) return [];
+  return (bracket[1] ?? "")
+    .split(",")
+    .map((s) => s.trim().replace(/^:/, ""))
+    .filter(Boolean);
+}
+
+/**
+ * Parse a single `before_action` / `before_filter` line and return a
+ * BeforeAction entry, or null when the line doesn't match the pattern.
+ */
+function parseBeforeAction(trimmed: string): BeforeAction | null {
+  // Match `before_action :callback_name` with optional trailing options.
+  const m = trimmed.match(
+    /^(?:before_action|before_filter)\s+:(\w+[?!]?)(.*)/,
+  );
+  if (!m) return null;
+  const callback = m[1]!;
+  const rest = m[2] ?? "";
+
+  // Capture the full bracket literal: `[:a, :b]` or `%i[a b]`.
+  const onlyMatch = rest.match(/\bonly:\s*(%[iI]\[[^\]]*\]|\[[^\]]*\])/);
+  const exceptMatch = rest.match(/\bexcept:\s*(%[iI]\[[^\]]*\]|\[[^\]]*\])/);
+
+  const only = onlyMatch ? new Set(parseSymbolList(onlyMatch[1]!)) : null;
+  const except = exceptMatch ? new Set(parseSymbolList(exceptMatch[1]!)) : null;
+
+  return { callback, only, except };
+}
+
+/** Return true when the given before_action applies to the named action. */
+function beforeActionApplies(ba: BeforeAction, actionName: string): boolean {
+  if (ba.only !== null) return ba.only.has(actionName);
+  if (ba.except !== null) return !ba.except.has(actionName);
+  return true;
+}
+
+// ActiveRecord class-level methods used to query or persist model data.
+// Presence of any of these on a PascalCase receiver is a reliable signal
+// that the receiver is an AR model, not a Ruby stdlib class.
+const AR_CLASS_METHODS = new Set([
+  "all", "find", "find_by", "find_by!", "find_or_create_by", "find_or_initialize_by",
+  "where", "first", "last", "count", "sum", "average", "minimum", "maximum",
+  "ids", "pluck", "exists?", "any?", "many?",
+  "create", "create!", "update_all", "destroy_all", "delete_all",
+  "insert", "upsert", "insert_all", "upsert_all",
+  "new", "build",
+]);
+
+// Common Ruby stdlib / Rails framework classes that show up in controllers
+// but are NOT AR models; excluded to avoid false positives on e.g. `String.new`.
+const RUBY_BUILTIN_CLASSES = new Set([
+  "Array", "Hash", "String", "Integer", "Float", "Symbol", "Numeric",
+  "Range", "Regexp", "Proc", "IO", "File", "Dir", "Time", "Thread",
+  "Struct", "Set", "Pathname",
+]);
+
+// Ruby control-flow keywords and common built-ins excluded from callee extraction.
+const RUBY_KEYWORDS = new Set([
+  "if", "unless", "while", "until", "for", "do", "begin", "rescue",
+  "ensure", "raise", "require", "require_relative", "include", "extend",
+  "prepend", "def", "class", "module", "end", "puts", "print", "pp",
+  "return", "yield", "super", "and", "or", "not", "when", "case",
+  "then", "break", "next", "redo", "retry", "attr_reader", "attr_writer",
+  "attr_accessor",
+]);
+
+// Ruby stdlib method names that are noise in the callees hint. Constructor,
+// less-overridden conversion methods, specific Enumerable methods, format
+// helpers, and Logger methods. Generic Enumerable names (each, map, select,
+// find, first, last, any?, all?, count, size) are NOT included because they
+// collide with business calls. Common-override conversions (to_s, to_i) are
+// excluded for the same reason. Mirrors the Java / C# stdlib-filter philosophy.
+const RUBY_STDLIB_METHODS = new Set([
+  // Constructor
+  "new",
+  // Conversion (less commonly overridden than to_s / to_i)
+  "to_a", "to_h", "to_sym", "to_str", "to_f", "to_r", "to_c", "to_proc",
+  // Specific Enumerable (less common as business names)
+  "each_with_index", "each_with_object", "inject", "flat_map",
+  "group_by", "partition", "tally", "min_by", "max_by", "sort_by",
+  "take_while", "drop_while", "chunk_while", "slice_when",
+  // Format helpers (Kernel)
+  "printf", "sprintf",
+  // Logger (Rails.logger.X / logger.X with parens)
+  "debug", "info", "warn", "error", "fatal",
+]);
+
+/**
+ * Scan method source for `ModelName.ar_method(` patterns and return a
+ * deduplicated list of model names. Only PascalCase identifiers paired with
+ * a known AR class-method name are recorded; Ruby stdlib classes are excluded.
+ */
+function extractActiveRecordModels(source: string): string[] {
+  const seen = new Set<string>();
+  const re = /\b([A-Z][A-Za-z0-9_]*)\.([a-z_!?]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const model = m[1]!;
+    const method = m[2]!;
+    if (AR_CLASS_METHODS.has(method) && !RUBY_BUILTIN_CLASSES.has(model)) {
+      seen.add(model);
+    }
+  }
+  return [...seen];
+}
+
 // Keywords that open a block terminated by `end` (excluding `def`, which
 // is handled explicitly so we can extract full method bodies).
 const BLOCK_OPENER_RE =
@@ -48,7 +174,10 @@ export function parseRuby(
   relativePath: string,
   source: string,
 ): Candidate[] {
-  const basename = path.basename(filePath);
+  // Lowercase basename so the gate matches the dispatcher's case-insensitive
+  // extension match in parsers/index.ts (e.g., Users_Controller.RB routed by
+  // the dispatcher used to drop here on a strict-case endsWith check).
+  const basename = path.basename(filePath).toLowerCase();
   // Only parse files following the Rails controller naming convention.
   if (!basename.endsWith("_controller.rb")) return [];
 
@@ -64,6 +193,7 @@ export function parseRuby(
   let classDepth = -1; // outerDepth at the moment we entered the class
   let inClass = false;
   let privateSection = false;
+  const beforeActions: BeforeAction[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
@@ -78,6 +208,16 @@ export function parseRuby(
       outerDepth++;
       inClass = true;
       continue;
+    }
+
+    // ---- before_action / before_filter declarations -------------------
+    // Collect at immediate class-body depth (not inside methods).
+    if (inClass && outerDepth === classDepth + 1) {
+      const ba = parseBeforeAction(trimmed);
+      if (ba) {
+        beforeActions.push(ba);
+        continue;
+      }
     }
 
     // ---- Private/protected section boundary ---------------------------
@@ -106,7 +246,7 @@ export function parseRuby(
         const lineStart = i + 1; // 1-indexed
 
         const { endIdx, methodSource } = extractMethodBody(lines, i);
-        const hints = buildHints(methodName, paramStr, className);
+        const hints = buildHints(methodName, paramStr, className, beforeActions, methodSource);
 
         candidates.push({
           language: "ruby",
@@ -245,6 +385,8 @@ function buildHints(
   methodName: string,
   paramStr: string,
   className: string,
+  beforeActions: BeforeAction[] = [],
+  methodSource = "",
 ): CandidateHints {
   const hints: CandidateHints = {};
 
@@ -272,6 +414,157 @@ function buildHints(
         const match = p.match(/^[*&]*\s*(\w+)/);
         return { name: match?.[1] ?? p };
       });
+  }
+
+  // Surface applicable before_action callbacks as auth notes so the LLM
+  // can describe access control without reading the class body.
+  const applicableCallbacks = beforeActions
+    .filter((ba) => beforeActionApplies(ba, methodName))
+    .map((ba) => `:${ba.callback}`);
+  if (applicableCallbacks.length > 0) {
+    hints.notes = [`before_action: ${applicableCallbacks.join(", ")}`];
+  }
+
+  // Extract ActiveRecord model references from the method body.
+  if (methodSource) {
+    const models = extractActiveRecordModels(methodSource);
+    if (models.length > 0) hints.databaseTables = models;
+
+    // Function callees (rough: word followed by `(`).
+    // Skip `def` lines so the method's own name is not recorded as a callee.
+    const methodBody = methodSource
+      .split("\n")
+      .filter((line) => !/^\s*def\s/.test(line))
+      .join("\n");
+    const callees = new Set<string>();
+    const callRe = /\b([a-zA-Z_][\w]*)\s*\(/g;
+    let cm: RegExpExecArray | null;
+    while ((cm = callRe.exec(methodBody)) !== null) {
+      const name = cm[1] ?? "";
+      if (name.length < 3) continue;
+      if (RUBY_KEYWORDS.has(name)) continue;
+      if (RUBY_STDLIB_METHODS.has(name)) continue;
+      callees.add(name);
+    }
+    if (callees.size > 0) hints.callees = [...callees].slice(0, 30);
+
+    // Side-effect notes: ActionMailer and background job queueing are
+    // high-blast-radius operations that BAs need to know about.
+    const sideEffects: string[] = [];
+    // ActionMailer: `UserMailer.welcome.deliver_later` / `deliver_now`
+    if (/\.\s*deliver_(?:later|now|later!|now!)/.test(methodSource)) {
+      sideEffects.push("Sends email (ActionMailer)");
+    }
+    // ActiveJob / Sidekiq / Resque: `SomeJob.perform_later` / `perform_async` /
+    // `perform_in` / `perform_at`
+    if (/\bperform_(?:later|async|in|at)\s*\(/.test(methodSource)) {
+      sideEffects.push("Enqueues background job");
+    }
+    // Message broker publishing. Three dominant Ruby broker libraries:
+    //   - Bunny (RabbitMQ): `Bunny.new(...)` opens a connection; the
+    //     presence of `Bunny.new` in a method body almost always leads to
+    //     `exchange.publish(...)` a few lines later -- flagging the connection
+    //     is the conservative signal.
+    //   - Karafka (Kafka): `Karafka.producer.produce_sync(...)` and
+    //     `produce_async(...)` are the two canonical publish paths in Karafka 2.x.
+    //   - ruby-kafka: `kafka.deliver_message(...)` is the one-call publish API.
+    // Mirrors Java JMS/AMQP/Kafka and C# MassTransit/Azure Service Bus notes.
+    if (
+      /\bBunny\.new\s*\(/.test(methodSource)
+      || /\bKarafka\.producer\.produce_(?:sync|async)\s*\(/.test(methodSource)
+      || /\bkafka\.deliver_message\s*\(/.test(methodSource)
+    ) {
+      sideEffects.push("Sends message to broker (Bunny / Karafka)");
+    }
+    // Common Ruby HTTP clients: HTTParty, Faraday, Net::HTTP, rest-client
+    if (/\b(HTTParty|Faraday|RestClient)\b/.test(methodSource)
+      || /Net::HTTP\b/.test(methodSource)) {
+      sideEffects.push("Makes outbound HTTP request");
+    }
+    // External process execution. Ruby has many idioms for spawning a child
+    // process; this detector covers the five most common, all audit-critical
+    // because the spawned process inherits the server's privileges:
+    //   - system("cmd", ...) / system 'cmd' / system "cmd"  (Kernel#system)
+    //   - `cmd` / `cmd with args`                            (backtick literal)
+    //   - IO.popen("cmd", ...)                               (pipe)
+    //   - Process.spawn / Process.exec                       (explicit)
+    //   - Open3.popen3 / capture3 / capture2 / capture2e / popen2 / popen2e
+    // The `system` matcher requires the next token to be `(`, `'`, or `"` so
+    // it doesn't trip on incidental uses like `obj.system` or `system.foo`.
+    // Mirrors Java's Runtime.exec / ProcessBuilder and C#'s Process.Start
+    // process-execution notes.
+    if (
+      /\bsystem\s*[("']/.test(methodSource)
+      || /`[^`\n]+`/.test(methodSource)
+      || /\bIO\.popen\b/.test(methodSource)
+      || /\bProcess\.(?:spawn|exec)\b/.test(methodSource)
+      || /\bOpen3\.(?:popen3|capture3|capture2|capture2e|popen2|popen2e)\b/.test(methodSource)
+    ) {
+      sideEffects.push("Executes external process");
+    }
+    // Cache mutation. Rails.cache.write / .delete / .delete_matched / .clear
+    // mutate shared cache state. Read-only operations (Rails.cache.read,
+    // .fetch, .exist?) are intentionally NOT flagged: no blast radius beyond
+    // a possible cache miss. The .clear and .delete_matched variants in
+    // particular are extremely high-blast-radius (clear ALL keys vs all keys
+    // matching a pattern); the LLM should surface those as audit-critical
+    // business rules. Mirrors Java @CacheEvict/@CachePut and C# IMemoryCache
+    // mutation detection.
+    if (/\bRails\.cache\.(?:write|write_multi|delete|delete_matched|delete_multi|clear)\b/.test(methodSource)) {
+      sideEffects.push("Mutates application cache");
+    }
+    // Database transactions. Rails wraps atomic operations with
+    // `Model.transaction do ... end` (or `{ ... }` curly-block form).
+    // The pattern requires `.transaction` to be followed by `do`, `{`, or `(`
+    // so common false positives are filtered out:
+    //   - `record.transaction_id`  -> no block delimiter, skipped
+    //   - `account.transactions`   -> plural, no block delimiter, skipped
+    //   - `Account.transaction do` -> matches (Rails idiom)
+    //   - `Account.transaction { ... }` -> matches (curly block)
+    //   - `Account.transaction(requires_new: true) do` -> matches (with args)
+    if (/\.transaction\s*(?:do\b|\{|\()/.test(methodSource)) {
+      sideEffects.push("Executes within a database transaction");
+    }
+    // Stored procedure calls. Two reliable Rails patterns:
+    //   1. exec_stored_procedure('proc', params) -- SQL Server adapter
+    //      (ActiveRecord SQLServer Adapter gem). Method name is proc-specific;
+    //      no Rails core method shares this name.
+    //   2. connection.execute("CALL proc_name(...)") -- MySQL stored proc.
+    //      connection.execute("EXEC proc_name ...") -- SQL Server direct call.
+    //      The CALL/EXEC keyword at the start of the SQL string literal is
+    //      exclusively for stored-procedure invocation; plain SELECT/INSERT/UPDATE
+    //      queries never start with these words.
+    // Both signals carry audit value: the proc may contain triggers,
+    // cross-table writes, and logic invisible in the calling controller.
+    // Mirrors Django cursor.callproc, C# CommandType.StoredProcedure, and
+    // Java prepareCall / createStoredProcedureQuery / SimpleJdbcCall detection.
+    if (
+      /\bexec_stored_procedure\s*\(/.test(methodSource)
+      || /\.execute\s*\(\s*["']\s*(?:CALL|EXEC)\s+/i.test(methodSource)
+    ) {
+      sideEffects.push("Calls stored procedure");
+    }
+    // Filesystem mutations. Writing, deleting, moving, or creating files
+    // affects shared disk state and is audit-relevant. Reads (File.read,
+    // File.readlines, File.foreach, File.exist?) are intentionally NOT
+    // flagged: no blast radius. Detects four families:
+    //   - File class mutators: write, delete, rename, truncate, unlink,
+    //     chmod, chown
+    //   - File.open with write or append mode (second arg starts with w/a)
+    //   - FileUtils mutators: cp, cp_r, mv, rm, rm_f, rm_rf, mkdir, mkdir_p,
+    //     touch, chmod, chown, ln, ln_s, remove
+    //   - Dir mutators: mkdir, rmdir, delete, unlink
+    if (
+      /\bFile\.(?:write|delete|rename|truncate|unlink|chmod|chown)\s*\(/.test(methodSource)
+      || /\bFile\.open\s*\(\s*[^,)]+,\s*["'][wa]/.test(methodSource)
+      || /\bFileUtils\.(?:cp|cp_r|mv|rm|rm_f|rm_rf|mkdir|mkdir_p|touch|chmod|chown|ln|ln_s|remove)\b/.test(methodSource)
+      || /\bDir\.(?:mkdir|rmdir|delete|unlink)\s*\(/.test(methodSource)
+    ) {
+      sideEffects.push("Writes to file system");
+    }
+    if (sideEffects.length > 0) {
+      hints.notes = [...(hints.notes ?? []), ...sideEffects];
+    }
   }
 
   return hints;

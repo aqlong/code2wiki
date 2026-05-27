@@ -8,8 +8,14 @@ export function slugify(input: string): string {
     .trim()
     .replace(/['"]/g, "")
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 80);
+    .slice(0, 80)
+    // Trim leading/trailing dashes AFTER the cap: a slice that lands on a
+    // dash boundary (e.g. a long "word word word ..." title where the 80th
+    // char is a dash separator) would otherwise leave a trailing "-" in
+    // the slug. That dash bleeds into stableId's
+    // `${language}-${path}-${fn}-v1` template, producing a visible "--v1"
+    // double dash on the upsert key.
+    .replace(/^-+|-+$/g, "");
 }
 
 /**

@@ -58,6 +58,12 @@ describe("defaultConfig", () => {
       "**/views.py",
       "**/*_views.py",
       "**/views/**/*.py",
+      "**/*.cs",
+      "**/*.aspx.cs",
+      "**/*.ascx.cs",
+      "**/*.aspx",
+      "**/*.ascx",
+      "**/*.asax",
     ]);
     expect(cfg.exclude).toContain("**/node_modules/**");
     expect(cfg.exclude).toContain("**/references/**");
@@ -247,4 +253,5 @@ describe("loadConfig, schema passthrough on valid input", () => {
     const cfg = await loadConfig(dir);
     expect(cfg.includeJmhBenchmarks).toBe(true);
   });
+
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractUseCase, type LlmFn } from "./extractor.js";
+import { extractUseCase, pairAspxCandidates, type LlmFn } from "./extractor.js";
 import { defaultConfig } from "./config.js";
 import {
   formatRetryHint,
@@ -429,6 +429,85 @@ describe("extractUseCase threads config.validator.tagJargonBlocklist", () => {
   });
 });
 
+describe("extractUseCase threads validateNotesPropagated", () => {
+  // Regression guard for the notes-propagation call added alongside the
+  // NOTE_KEYWORDS map in validator.ts. extractor.ts wires
+  // validateNotesPropagated(llmResult, candidate.hints.notes) on BOTH the
+  // first-draft AND the retry-draft path. validator.test.ts pins the
+  // validator's own behavior; nothing pins the threading. A regression
+  // dropping the call on either path would silently let un-surfaced
+  // compliance signals (email, HTTP, transactions, etc.) pass through
+  // without any audit-log record of the miss.
+  //
+  // Test shape A: draft with an empty summary (forces retry path so both
+  // firstIssues + retriedIssues are observable) AND a candidate whose
+  // hints.notes contains "Sends email". The LLM mock never surfaces an
+  // email-related word. Both issue arrays MUST carry the notes-propagation
+  // warn. A regression dropping the call on EITHER path fails the
+  // corresponding assertion independently.
+  //
+  // Test shape B: first draft is broken (empty summary), retried draft
+  // surfaces the compliance signal. retriedIssues must NOT carry the warn,
+  // confirming the retry path re-runs validateNotesPropagated on the new
+  // draft rather than re-using the first-draft issues.
+  const NOTES_CANDIDATE: Candidate = {
+    ...CANDIDATE,
+    hints: { ...CANDIDATE.hints, notes: ["Sends email"] },
+  };
+
+  it("notes-propagation warn appears in BOTH firstIssues and retriedIssues when the LLM never surfaces the note", async () => {
+    const draft = { ...BROKEN_DRAFT }; // empty summary forces retry; no email text anywhere
+    const llmFn: LlmFn = async () => draft;
+    const { retry } = await extractUseCase(
+      NOTES_CANDIDATE,
+      "test-project",
+      defaultConfig(),
+      META,
+      llmFn,
+    );
+    const firstNotesWarns = (retry?.firstIssues ?? []).filter(
+      (i) => i.severity === "warn" && i.message.includes("Sends email"),
+    );
+    const retriedNotesWarns = (retry?.retriedIssues ?? []).filter(
+      (i) => i.severity === "warn" && i.message.includes("Sends email"),
+    );
+    expect(firstNotesWarns.length).toBe(1);
+    expect(retriedNotesWarns.length).toBe(1);
+  });
+
+  it("notes-propagation warn disappears from retriedIssues when the retried draft surfaces the signal", async () => {
+    // First draft is broken + missing email; retried draft is structurally
+    // clean AND mentions email. retriedIssues must have zero notes warns,
+    // confirming the retry path calls validateNotesPropagated on the new
+    // draft rather than forwarding the first-draft issue list.
+    const firstDraft = { ...BROKEN_DRAFT };
+    const retriedDraft = {
+      ...GOOD_DRAFT,
+      business_rules: [{ rule: "A confirmation email is sent to the buyer." }],
+    };
+    const drafts = [firstDraft, retriedDraft];
+    const llmFn: LlmFn = async () => drafts.shift()!;
+    const { retry } = await extractUseCase(
+      NOTES_CANDIDATE,
+      "test-project",
+      defaultConfig(),
+      META,
+      llmFn,
+    );
+    expect(retry?.outcome).toBe("recovered");
+    const firstNotesWarns = (retry?.firstIssues ?? []).filter(
+      (i) => i.severity === "warn" && i.message.includes("Sends email"),
+    );
+    const retriedNotesWarns = (retry?.retriedIssues ?? []).filter(
+      (i) => i.severity === "warn" && i.message.includes("Sends email"),
+    );
+    // First draft didn't surface email → warn in firstIssues.
+    expect(firstNotesWarns.length).toBe(1);
+    // Retried draft DID surface email → no warn in retriedIssues.
+    expect(retriedNotesWarns.length).toBe(0);
+  });
+});
+
 describe("extractUseCase field mapping", () => {
   const llmReturning = (draft: unknown): LlmFn => async () => draft;
 
@@ -807,5 +886,194 @@ describe("extractUseCase chain-of-correction retry, argument passthrough", () =>
     expect(calls[1]!.retryHint).toBe(
       formatRetryHint(validateUseCaseDraft(BROKEN_DRAFT)),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pairAspxCandidates: ADR-040 D4 markup + code-behind pairing
+// ---------------------------------------------------------------------------
+
+describe("pairAspxCandidates", () => {
+  function aspxCandidate(relativePath: string): Candidate {
+    return {
+      language: "csharp",
+      filePath: `/repo/${relativePath}`,
+      relativePath,
+      name: relativePath.split("/").pop() ?? relativePath,
+      kind: "aspx-page",
+      lineStart: 1,
+      lineEnd: 10,
+      source: `<form runat="server"><asp:Button runat="server" OnClick="x" /></form>`,
+      hints: {},
+      companionFile: `${relativePath}.cs`,
+      handlerNames: ["x"],
+    };
+  }
+
+  function webformsHandlerCandidate(
+    relativePath: string,
+    methodName: string,
+  ): Candidate {
+    return {
+      language: "csharp",
+      filePath: `/repo/${relativePath}`,
+      relativePath,
+      name: `Default#${methodName}`,
+      kind: "webforms-handler",
+      lineStart: 5,
+      lineEnd: 10,
+      source: `protected void ${methodName}(object sender, EventArgs e) { }`,
+      hints: {},
+    };
+  }
+
+  it("pairs a Default.aspx candidate with its Default.aspx.cs sibling", () => {
+    const candidates: Candidate[] = [
+      aspxCandidate("Web/Default.aspx"),
+      webformsHandlerCandidate("Web/Default.aspx.cs", "Page_Load"),
+    ];
+    const fileSources = new Map<string, string>([
+      ["Web/Default.aspx.cs", "public partial class Default : Page {\n  protected void Page_Load(object sender, EventArgs e) { }\n}"],
+    ]);
+    const paired = pairAspxCandidates(candidates, fileSources);
+    const aspx = paired.find((c) => c.kind === "aspx-page")!;
+    expect(aspx.companionSources).toHaveLength(1);
+    expect(aspx.companionSources?.[0]).toEqual({
+      path: "Web/Default.aspx.cs",
+      content: "public partial class Default : Page {\n  protected void Page_Load(object sender, EventArgs e) { }\n}",
+    });
+    // Code-behind candidates themselves do NOT receive companionSources;
+    // the pairing is only attached to the aspx-page side.
+    const handler = paired.find((c) => c.kind === "webforms-handler")!;
+    expect(handler.companionSources).toBeUndefined();
+  });
+
+  it("pairs a Menu.ascx user control with its Menu.ascx.cs sibling", () => {
+    const candidates: Candidate[] = [
+      aspxCandidate("Controls/Menu.ascx"),
+      webformsHandlerCandidate("Controls/Menu.ascx.cs", "rpt_ItemDataBound"),
+    ];
+    const fileSources = new Map<string, string>([
+      ["Controls/Menu.ascx.cs", "// menu code-behind"],
+    ]);
+    const paired = pairAspxCandidates(candidates, fileSources);
+    const aspx = paired.find((c) => c.kind === "aspx-page")!;
+    expect(aspx.companionSources?.[0]?.path).toBe("Controls/Menu.ascx.cs");
+    expect(aspx.companionSources?.[0]?.content).toBe("// menu code-behind");
+  });
+
+  it("leaves aspx candidates unpaired when no code-behind candidate exists and fileSources is empty", () => {
+    // Standalone .aspx page (no .aspx.cs sibling parsed in this run, no
+    // companion content pre-loaded) must pass through with companionSources
+    // undefined; not an error.
+    const candidates: Candidate[] = [aspxCandidate("Web/Standalone.aspx")];
+    const fileSources = new Map<string, string>();
+    const paired = pairAspxCandidates(candidates, fileSources);
+    expect(paired).toHaveLength(1);
+    expect(paired[0].kind).toBe("aspx-page");
+    expect(paired[0].companionSources).toBeUndefined();
+  });
+
+  it("pairs via companionFile hint when no .cs candidate exists but fileSources has the companion content", () => {
+    // When the user's config only includes *.aspx (not *.cs), no
+    // webforms-handler candidates are in the list and codeBehindPaths is
+    // empty. The caller (generate/replay) pre-loads the companion file into
+    // fileSources; pairAspxCandidates must use the companionFile hint as a
+    // fallback so the LLM still receives the code-behind context.
+    const aspx = aspxCandidate("Web/Payment.aspx");
+    const candidates: Candidate[] = [aspx];
+    const fileSources = new Map<string, string>([
+      ["Web/Payment.aspx.cs", "protected void btnPay_Click(object sender, EventArgs e) { ChargeCard(); }"],
+    ]);
+    const paired = pairAspxCandidates(candidates, fileSources);
+    const pairedAspx = paired.find((c) => c.kind === "aspx-page")!;
+    expect(pairedAspx.companionSources).toHaveLength(1);
+    expect(pairedAspx.companionSources![0]).toEqual({
+      path: "Web/Payment.aspx.cs",
+      content: "protected void btnPay_Click(object sender, EventArgs e) { ChargeCard(); }",
+    });
+  });
+
+  it("collapses multiple webforms-handler candidates from the same code-behind into one companionSources entry", () => {
+    // One .aspx.cs file may emit many webforms-handler Candidates (one per
+    // event method). They should all map to the same file path, so the
+    // aspx-page candidate sees a single companionSources entry pointing at
+    // that file rather than N duplicates.
+    const candidates: Candidate[] = [
+      aspxCandidate("Web/Checkout.aspx"),
+      webformsHandlerCandidate("Web/Checkout.aspx.cs", "Page_Load"),
+      webformsHandlerCandidate("Web/Checkout.aspx.cs", "btnPay_Click"),
+      webformsHandlerCandidate("Web/Checkout.aspx.cs", "btnCancel_Click"),
+    ];
+    const fileSources = new Map<string, string>([
+      ["Web/Checkout.aspx.cs", "// checkout code-behind"],
+    ]);
+    const paired = pairAspxCandidates(candidates, fileSources);
+    const aspx = paired.find((c) => c.kind === "aspx-page")!;
+    expect(aspx.companionSources).toHaveLength(1);
+    expect(aspx.companionSources?.[0]?.path).toBe("Web/Checkout.aspx.cs");
+  });
+
+  it("passes Java and CFML candidates through untouched", () => {
+    // Non-WebForms candidates have no pairing key and must be returned
+    // identically; the pairer should not mutate language="java" or
+    // language="cfml" inputs in any way.
+    const javaCandidate: Candidate = {
+      language: "java",
+      filePath: "/repo/src/Foo.java",
+      relativePath: "src/Foo.java",
+      name: "Foo.bar",
+      kind: "controller-method",
+      lineStart: 1,
+      lineEnd: 5,
+      source: "public String bar() { return null; }",
+      hints: { annotations: ["GetMapping"] },
+    };
+    const cfmlCandidate: Candidate = {
+      language: "cfml",
+      filePath: "/repo/foo.cfm",
+      relativePath: "foo.cfm",
+      name: "foo",
+      kind: "cf-tag-function",
+      lineStart: 1,
+      lineEnd: 3,
+      source: "<cfset x = 1>",
+      hints: {},
+    };
+    const paired = pairAspxCandidates([javaCandidate, cfmlCandidate]);
+    expect(paired).toHaveLength(2);
+    // Identity preservation: untouched candidates come back by reference.
+    expect(paired[0]).toBe(javaCandidate);
+    expect(paired[1]).toBe(cfmlCandidate);
+    expect(paired[0].companionSources).toBeUndefined();
+    expect(paired[1].companionSources).toBeUndefined();
+  });
+
+  it("ignores .vb files (no pairing) and passes them through unchanged", () => {
+    // VB.NET code-behind is out of scope per ADR-040 D1. The pairing-key
+    // regex only matches .aspx / .ascx / .asax (+ their .cs duals); .vb
+    // has no key, so it never matches and never gains companionSources.
+    const aspx = aspxCandidate("Web/VbPage.aspx");
+    const vbCandidate: Candidate = {
+      language: "csharp", // parser surface is still csharp-shaped if it ever lands
+      filePath: "/repo/Web/VbPage.aspx.vb",
+      relativePath: "Web/VbPage.aspx.vb",
+      name: "VbPage#Page_Load",
+      kind: "webforms-handler",
+      lineStart: 1,
+      lineEnd: 5,
+      source: "Protected Sub Page_Load() End Sub",
+      hints: {},
+    };
+    const fileSources = new Map<string, string>([
+      ["Web/VbPage.aspx.vb", "Protected Sub Page_Load() End Sub"],
+    ]);
+    const paired = pairAspxCandidates([aspx, vbCandidate], fileSources);
+    // VB file passes through by identity.
+    expect(paired[1]).toBe(vbCandidate);
+    // aspx candidate has no .cs sibling so no companionSources is attached.
+    const pairedAspx = paired[0];
+    expect(pairedAspx.kind).toBe("aspx-page");
+    expect(pairedAspx.companionSources).toBeUndefined();
   });
 });

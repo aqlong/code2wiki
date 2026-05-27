@@ -65,6 +65,24 @@ describe("parseDjango: file gate", () => {
     expect(candidates(source, "serializers.py")).toHaveLength(0);
     expect(candidates(source, "admin.py")).toHaveLength(0);
   });
+
+  it("matches the basename case-insensitively (parity with the dispatcher)", () => {
+    // parsers/index.ts dispatches on path.extname(...).toLowerCase(), so a
+    // Windows-origin file like Views.PY routes through to parseDjango. The
+    // basename gate must accept the same set or the file silently drops.
+    expect(candidates(source, "Views.PY")).toHaveLength(1);
+    expect(candidates(source, "views.PY")).toHaveLength(1);
+    expect(candidates(source, "User_Views.PY")).toHaveLength(1);
+    // The `/views/` path-segment branch must also tolerate uppercased segments
+    // and extensions (case-insensitive filesystems on macOS / Windows).
+    expect(
+      parseDjango("/app/Views/users.PY", "app/Views/users.PY", source),
+    ).toHaveLength(1);
+    // Sanity: look-alike directories still must not match even when uppercased.
+    expect(
+      parseDjango("/app/Subviews/foo.PY", "app/Subviews/foo.PY", source),
+    ).toHaveLength(0);
+  });
 });
 
 // ---- Function-based views (FBVs) -----------------------------------------
@@ -782,6 +800,77 @@ def my_view(request, opts={"a": 1, "b": 2}):
     const names_ = cs[0]!.hints.parameters!.map((p) => p.name);
     expect(names_).toEqual(["request", "opts"]);
   });
+
+  // --- Type annotation extraction ---
+
+  it("extracts type from a simple annotated FBV param", () => {
+    const source = `
+def order_detail(request, pk: int):
+    pass
+`;
+    const cs = candidates(source);
+    const params = cs[0]!.hints.parameters!;
+    const pk = params.find((p) => p.name === "pk")!;
+    expect(pk.type).toBe("int");
+    expect(params.find((p) => p.name === "request")!.type).toBeUndefined();
+  });
+
+  it("strips the default value from an annotated param with a default", () => {
+    const source = `
+def search(request, status: str = "active", limit: int = 20):
+    pass
+`;
+    const cs = candidates(source);
+    const params = cs[0]!.hints.parameters!;
+    expect(params.find((p) => p.name === "status")!.type).toBe("str");
+    expect(params.find((p) => p.name === "limit")!.type).toBe("int");
+  });
+
+  it("extracts type from a generic annotation with a default (depth-aware = search)", () => {
+    // The `=` inside `[]` must not be mistaken for the default-value separator.
+    const source = `
+def my_view(request, filters: Dict[str, int] = None):
+    pass
+`;
+    const cs = candidates(source);
+    const params = cs[0]!.hints.parameters!;
+    expect(params.find((p) => p.name === "filters")!.type).toBe("Dict[str, int]");
+  });
+
+  it("extracts type from a nested generic annotation", () => {
+    const source = `
+def my_view(request, items: List[Tuple[str, int]]):
+    pass
+`;
+    const cs = candidates(source);
+    expect(cs[0]!.hints.parameters!.find((p) => p.name === "items")!.type)
+      .toBe("List[Tuple[str, int]]");
+  });
+
+  it("extracts type from CBV method params (filters self and request)", () => {
+    const source = `
+class OrderView(APIView):
+    def post(self, request, user_id: int, status: str = "open"):
+        pass
+`;
+    const cs = candidates(source);
+    const params = cs[0]!.hints.parameters!;
+    // self and request are filtered by buildCbvHints
+    expect(params.find((p) => p.name === "user_id")!.type).toBe("int");
+    expect(params.find((p) => p.name === "status")!.type).toBe("str");
+    expect(params.every((p) => p.name !== "self" && p.name !== "request")).toBe(true);
+  });
+
+  it("leaves type undefined when param has no annotation", () => {
+    const source = `
+def my_view(request, pk, slug="hello"):
+    pass
+`;
+    const cs = candidates(source);
+    const params = cs[0]!.hints.parameters!;
+    expect(params.find((p) => p.name === "pk")!.type).toBeUndefined();
+    expect(params.find((p) => p.name === "slug")!.type).toBeUndefined();
+  });
 });
 
 // ---- Source extraction ---------------------------------------------------
@@ -991,5 +1080,890 @@ class UserView(View):
         return HttpResponse("ok")
 `;
     expect(names(source)).toEqual(["UserView#get"]);
+  });
+
+  // --- Auth decorator / permission notes ---
+
+  it("surfaces @login_required on FBV as hints.notes", () => {
+    const source = `
+@login_required
+def dashboard(request):
+    return render(request, 'dashboard.html')
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.notes).toEqual(["auth: login_required"]);
+  });
+
+  it("surfaces @permission_required with arg on FBV", () => {
+    const source = `
+@permission_required('myapp.can_edit')
+def edit_item(request, pk):
+    pass
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.notes).toEqual(["auth: permission_required('myapp.can_edit')"]);
+  });
+
+  it("surfaces @staff_member_required on FBV", () => {
+    const source = `
+@staff_member_required
+def admin_panel(request):
+    pass
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.notes).toEqual(["auth: staff_member_required"]);
+  });
+
+  it("accumulates multiple auth decorators on FBV in declaration order", () => {
+    const source = `
+@login_required
+@permission_required('myapp.can_view')
+def secure_view(request):
+    pass
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.notes).toEqual([
+      "auth: login_required",
+      "auth: permission_required('myapp.can_view')",
+    ]);
+  });
+
+  it("does not add notes when FBV has no auth decorators", () => {
+    const source = `
+def public_view(request):
+    return render(request, 'public.html')
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.notes).toBeUndefined();
+  });
+
+  it("surfaces DRF class-level permission_classes on every CBV method", () => {
+    const source = `
+class OrderViewSet(ModelViewSet):
+    permission_classes = [IsAuthenticated]
+
+    def list(self, request):
+        return Response([])
+
+    def retrieve(self, request, pk=None):
+        return Response({})
+`;
+    const cs = candidates(source);
+    expect(cs).toHaveLength(2);
+    for (const c of cs) {
+      expect(c.hints.notes).toEqual(["permission_classes: IsAuthenticated"]);
+    }
+  });
+
+  it("surfaces multiple DRF permission classes joined by comma", () => {
+    const source = `
+class AdminViewSet(ModelViewSet):
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def list(self, request):
+        return Response([])
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.notes).toEqual(["permission_classes: IsAuthenticated, IsAdminUser"]);
+  });
+
+  it("resets permission_classes when a new class is entered", () => {
+    const source = `
+class SecureView(ModelViewSet):
+    permission_classes = [IsAuthenticated]
+
+    def list(self, request):
+        return Response([])
+
+class OpenView(APIView):
+    def get(self, request):
+        return Response({})
+`;
+    const cs = candidates(source);
+    const byName = Object.fromEntries(cs.map((c) => [c.name, c]));
+    expect(byName["SecureView#list"]?.hints.notes).toEqual(["permission_classes: IsAuthenticated"]);
+    expect(byName["OpenView#get"]?.hints.notes).toBeUndefined();
+  });
+
+  // Real DRF code routinely formats permission_classes across multiple lines;
+  // the original single-line-only regex (`[^\]]*\]`) silently dropped any list
+  // whose closing `]` was on a different line, so every CBV method in that
+  // class would lose the permission_classes note. Pin the multi-line accumulator.
+  it("surfaces permission_classes when the list spans multiple lines", () => {
+    const source = `
+class ReportViewSet(ModelViewSet):
+    permission_classes = [
+        IsAuthenticated,
+        IsAdminUser,
+    ]
+
+    def list(self, request):
+        return Response([])
+
+    def retrieve(self, request, pk=None):
+        return Response({})
+`;
+    const cs = candidates(source);
+    expect(cs).toHaveLength(2);
+    for (const c of cs) {
+      expect(c.hints.notes).toEqual(["permission_classes: IsAuthenticated, IsAdminUser"]);
+    }
+  });
+
+  it("surfaces permission_classes spanning two lines without a trailing comma", () => {
+    const source = `
+class WideView(ModelViewSet):
+    permission_classes = [IsAuthenticated,
+                          IsAdminUser]
+
+    def list(self, request):
+        return Response([])
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.notes).toEqual(["permission_classes: IsAuthenticated, IsAdminUser"]);
+  });
+});
+
+// ---- ORM model extraction -----------------------------------------------
+
+describe("parseDjango: ORM model extraction (databaseTables)", () => {
+  it("extracts a single model from .objects. call in an FBV", () => {
+    const source = `
+def list_articles(request):
+    articles = Article.objects.filter(published=True)
+    return render(request, 'articles.html', {'articles': articles})
+`;
+    const cs = candidates(source);
+    expect(cs).toHaveLength(1);
+    expect(cs[0]?.hints.databaseTables).toEqual(["Article"]);
+  });
+
+  it("extracts multiple distinct models from an FBV body", () => {
+    const source = `
+def dashboard(request):
+    users = User.objects.all()
+    posts = Post.objects.filter(active=True)
+    tags = Tag.objects.order_by('name')
+    return render(request, 'dashboard.html', {})
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.databaseTables).toEqual(expect.arrayContaining(["User", "Post", "Tag"]));
+    expect(cs[0]?.hints.databaseTables).toHaveLength(3);
+  });
+
+  it("deduplicates repeated .objects. calls to the same model", () => {
+    const source = `
+def article_detail(request, pk):
+    article = Article.objects.get(pk=pk)
+    related = Article.objects.filter(category=article.category)[:5]
+    return render(request, 'detail.html', {})
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.databaseTables).toEqual(["Article"]);
+  });
+
+  it("does not surface lowercase identifiers (not models)", () => {
+    const source = `
+def my_view(request):
+    result = manager.objects.all()
+    return render(request, 'tmpl.html', {})
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.databaseTables).toBeUndefined();
+  });
+
+  it("extracts models from a CBV method body", () => {
+    const source = `
+class ArticleListView(View):
+    def get(self, request):
+        qs = Article.objects.filter(published=True)
+        return render(request, 'list.html', {'articles': qs})
+`;
+    const cs = candidates(source);
+    expect(cs).toHaveLength(1);
+    expect(cs[0]?.hints.databaseTables).toEqual(["Article"]);
+  });
+
+  it("leaves databaseTables undefined when no .objects. call is present", () => {
+    const source = `
+def ping(request):
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.databaseTables).toBeUndefined();
+  });
+});
+
+// ---- CBV class-level queryset / model attribute extraction ---------------
+
+describe("parseDjango: CBV class-level model hints", () => {
+  it("extracts model from queryset class attribute", () => {
+    const source = `
+class UserListView(ListAPIView):
+    queryset = User.objects.all()
+    def get(self, request):
+        return Response(self.get_queryset())
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.databaseTables).toEqual(expect.arrayContaining(["User"]));
+  });
+
+  it("extracts model from model class attribute", () => {
+    const source = `
+class PostDetailView(RetrieveAPIView):
+    model = Post
+    def get(self, request):
+        return Response({})
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.databaseTables).toEqual(expect.arrayContaining(["Post"]));
+  });
+
+  it("merges class-level and method-body model refs without duplicates", () => {
+    const source = `
+class OrderListView(ListAPIView):
+    queryset = Order.objects.all()
+    def get(self, request):
+        items = LineItem.objects.filter(order__in=self.get_queryset())
+        return Response({})
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.databaseTables).toEqual(
+      expect.arrayContaining(["Order", "LineItem"]),
+    );
+    expect(cs[0]?.hints.databaseTables).toHaveLength(2);
+  });
+
+  it("class-level model does not appear twice when also referenced in body", () => {
+    const source = `
+class ArticleView(RetrieveAPIView):
+    queryset = Article.objects.all()
+    def get(self, request):
+        obj = Article.objects.get(pk=request.GET['id'])
+        return Response({})
+`;
+    const cs = candidates(source);
+    const tables = cs[0]?.hints.databaseTables ?? [];
+    expect(tables.filter((t) => t === "Article")).toHaveLength(1);
+  });
+});
+
+// ---- Function callee extraction (callees) --------------------------------
+
+describe("parseDjango: callee extraction", () => {
+  it("surfaces helper function calls from an FBV body", () => {
+    const source = `
+def create_order(request):
+    validate_order(request.POST)
+    order = build_order(request.POST)
+    send_confirmation(order)
+    return JsonResponse({'id': order.id})
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.callees).toEqual(
+      expect.arrayContaining(["validate_order", "build_order", "send_confirmation"]),
+    );
+  });
+
+  it("surfaces helper calls from a CBV method body", () => {
+    const source = `
+class OrderCreateView(View):
+    def post(self, request):
+        validated = validate_payload(request.POST)
+        order = create_order(validated)
+        notify_warehouse(order)
+        return JsonResponse({'id': order.id})
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.callees).toEqual(
+      expect.arrayContaining(["validate_payload", "create_order", "notify_warehouse"]),
+    );
+  });
+
+  it("excludes Python keywords from callees", () => {
+    const source = `
+def index(request):
+    items = list(range(10))
+    return JsonResponse({'items': items})
+`;
+    const cs = candidates(source);
+    const callees = cs[0]?.hints.callees ?? [];
+    expect(callees).not.toContain("list");
+    expect(callees).not.toContain("range");
+    expect(callees).not.toContain("return");
+  });
+
+  it("leaves callees undefined when FBV body has no qualifying calls", () => {
+    const source = `
+def ping(request):
+    ok = True
+    return ok
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.callees).toBeUndefined();
+  });
+});
+
+// ---- Email and HTTP side-effect notes ------------------------------------
+
+describe("parseDjango: side-effect notes (email and HTTP)", () => {
+  it("surfaces email note when send_mail is present in FBV", () => {
+    const source = `
+def register(request):
+    user = User.objects.create(email=request.POST['email'])
+    send_mail('Welcome', 'Hi!', 'noreply@example.com', [user.email])
+    return JsonResponse({'id': user.id})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Sends email (Django mail)")).toBe(true);
+  });
+
+  it("surfaces email note for EmailMessage instantiation", () => {
+    const source = `
+def notify(request):
+    msg = EmailMessage(subject='Hi', body='Hello', to=['user@example.com'])
+    msg.send()
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Sends email (Django mail)")).toBe(true);
+  });
+
+  it("surfaces HTTP note when requests.post is called in CBV", () => {
+    const source = `
+class WebhookView(View):
+    def post(self, request):
+        payload = request.body
+        requests.post('https://hooks.example.com/notify', json={'data': payload})
+        return JsonResponse({'received': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Makes outbound HTTP request")).toBe(true);
+  });
+
+  it("surfaces HTTP note when httpx.get is called", () => {
+    const source = `
+def fetch_profile(request):
+    resp = httpx.get('https://api.example.com/profile')
+    return JsonResponse(resp.json())
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Makes outbound HTTP request")).toBe(true);
+  });
+
+  it("does not add side-effect notes when neither email nor HTTP is present", () => {
+    const source = `
+def ping(request):
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n.includes("email") || n.includes("HTTP"))).toBe(false);
+  });
+
+  // The two side-effect regexes have multiple alternatives. A single-entry
+  // deletion would silently degrade hint coverage with no test failure. These
+  // loops pin every alternative so a future refactor that drops one trips a
+  // named failure. Mirrors the Java / Ruby / C# per-alternative pattern.
+
+  it("email regex covers all 6 alternatives", () => {
+    const probes = [
+      { body: "send_mail('Hi', 'Body', 'noreply@x.com', ['user@x.com'])", label: "send_mail" },
+      { body: "send_mass_mail([('Hi', 'B', 'from@x', ['a@x'])])", label: "send_mass_mail" },
+      { body: "mail_admins('Subject', 'message')", label: "mail_admins" },
+      { body: "mail_managers('Subject', 'message')", label: "mail_managers" },
+      { body: "msg = EmailMessage('Hi', 'Body', 'from@x', ['to@x'])", label: "EmailMessage" },
+      { body: "msg = EmailMultiAlternatives('Hi', 'Body', 'from@x', ['to@x'])", label: "EmailMultiAlternatives" },
+    ];
+    for (const { body, label } of probes) {
+      const source = `
+def view(request):
+    ${body}
+    return JsonResponse({'ok': True})
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${label} should emit Django mail note`).toContain("Sends email (Django mail)");
+    }
+  });
+
+  it("HTTP regex covers all 3 client libraries", () => {
+    const probes = [
+      { body: "r = requests.post('https://x.com', json={})", label: "requests" },
+      { body: "r = httpx.get('https://x.com')", label: "httpx" },
+      { body: "r = urllib.request.urlopen('https://x.com')", label: "urllib.request.urlopen" },
+    ];
+    for (const { body, label } of probes) {
+      const source = `
+def view(request):
+    ${body}
+    return JsonResponse({'ok': True})
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${label} should emit HTTP note`).toContain("Makes outbound HTTP request");
+    }
+  });
+
+  it("requests HTTP regex covers all 8 verb methods", () => {
+    const verbs = ["get", "post", "put", "patch", "delete", "head", "options", "request"];
+    for (const verb of verbs) {
+      const source = `
+def view(request):
+    r = requests.${verb}('https://x.com')
+    return JsonResponse({'ok': True})
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `requests.${verb} should emit HTTP note`).toContain("Makes outbound HTTP request");
+    }
+  });
+
+  it("surfaces 'Writes to file system' for built-in open() with write mode", () => {
+    const source = `
+def export_csv(request):
+    with open('/tmp/users.csv', 'w') as f:
+        f.write(build_csv())
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Writes to file system");
+  });
+
+  it("surfaces filesystem note for os / shutil / pathlib / default_storage mutators", () => {
+    const source = `
+def process(request):
+    os.makedirs('/tmp/uploads', exist_ok=True)
+    shutil.move('/tmp/in.dat', '/tmp/processed/in.dat')
+    Path('/tmp/log.txt').write_text(request.POST['line'])
+    default_storage.save('avatars/x.png', request.FILES['avatar'])
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Writes to file system");
+  });
+
+  it("does NOT surface filesystem note for read-only file operations", () => {
+    const source = `
+def load(request):
+    with open('/tmp/in.csv') as f:
+        contents = f.read()
+    other = open('/tmp/other.csv', 'r').read()
+    exists = os.path.exists('/tmp/x.csv')
+    listed = os.listdir('/tmp')
+    text = Path('/tmp/y.txt').read_text()
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Writes to file system")).toBe(false);
+  });
+
+  it("os mutator regex covers all 11 alternatives", () => {
+    const mutators = [
+      "remove", "unlink", "rename", "rmdir", "makedirs", "mkdir",
+      "replace", "symlink", "link", "chmod", "chown",
+    ];
+    for (const m of mutators) {
+      const source = `
+def view(request):
+    os.${m}('/tmp/x', '/tmp/y')
+    return JsonResponse({'ok': True})
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `os.${m} should emit filesystem note`).toContain("Writes to file system");
+    }
+  });
+
+  it("shutil mutator regex covers all 7 alternatives", () => {
+    const mutators = ["copy", "copyfile", "copytree", "copy2", "copymode", "move", "rmtree"];
+    for (const m of mutators) {
+      const source = `
+def view(request):
+    shutil.${m}('/tmp/a', '/tmp/b')
+    return JsonResponse({'ok': True})
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `shutil.${m} should emit filesystem note`).toContain("Writes to file system");
+    }
+  });
+
+  it("open() mode regex covers w / a / x and b / + suffixes", () => {
+    const modes = ["w", "a", "x", "w+", "a+", "wb", "ab", "wb+"];
+    for (const mode of modes) {
+      const source = `
+def view(request):
+    f = open('/tmp/x', '${mode}')
+    return JsonResponse({'ok': True})
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `open(_, "${mode}") should emit filesystem note`).toContain("Writes to file system");
+    }
+  });
+
+  it("transaction note fires for with transaction.atomic() context manager", () => {
+    const source = `
+def transfer(request):
+    with transaction.atomic():
+        sender.debit(request.POST['amount'])
+        receiver.credit(request.POST['amount'])
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Executes within a database transaction");
+  });
+
+  it("transaction note fires for @transaction.atomic decorator", () => {
+    const source = `
+@transaction.atomic
+def checkout(request):
+    cart = Cart.objects.get(id=request.POST['cart_id'])
+    cart.checkout()
+    return JsonResponse({'id': cart.id})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Executes within a database transaction");
+  });
+
+  it("transaction note fires for @transaction.atomic() called form", () => {
+    const source = `
+@transaction.atomic()
+def refund(request):
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Executes within a database transaction");
+  });
+
+  it("transaction note does NOT fire for transaction_id or unrelated attribute access", () => {
+    // Defensive: \b...\b boundaries prevent transaction_id / atomic_block /
+    // similar attribute names from tripping the detector.
+    const source = `
+def show(request):
+    txn_id = request.POST['transaction_id']
+    return JsonResponse({'id': txn_id})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n.includes("database transaction"))).toBe(false);
+  });
+
+  it("cache-mutation note fires for cache.set / .delete / .clear (default cache)", () => {
+    const source = `
+def refresh(request):
+    cache.set('feed:' + request.user.id, build_feed())
+    cache.delete('stale:' + request.user.id)
+    return JsonResponse({'ok': True})
+
+def flush_all(request):
+    cache.clear()
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const refreshNotes = cs[0]?.hints.notes ?? [];
+    const flushNotes = cs[1]?.hints.notes ?? [];
+    expect(refreshNotes).toContain("Mutates application cache");
+    expect(flushNotes).toContain("Mutates application cache");
+  });
+
+  it("cache-mutation note fires for caches['named'].set indexer form", () => {
+    const source = `
+def write_session(request):
+    caches['sessions'].set('sid:' + request.session.session_key, request.user.id)
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Mutates application cache");
+  });
+
+  it("cache-mutation note fires for high-blast-radius variants (delete_pattern, delete_many, clear)", () => {
+    const source = `
+def reindex(request):
+    cache.delete_pattern('category:*')
+    return JsonResponse({'ok': True})
+
+def bulk_clear(request):
+    cache.delete_many(['k1', 'k2', 'k3'])
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    expect(cs[0]?.hints.notes ?? []).toContain("Mutates application cache");
+    expect(cs[1]?.hints.notes ?? []).toContain("Mutates application cache");
+  });
+
+  it("cache-mutation note does NOT fire for cache.get / .get_many / .has_key (read-only)", () => {
+    // Read-only access (and get_or_set, which is read-on-miss) is
+    // intentionally NOT flagged. No blast radius beyond a cache miss.
+    const source = `
+def show(request):
+    feed = cache.get('feed:' + request.user.id)
+    bulk = cache.get_many(['k1', 'k2'])
+    exists = cache.has_key('check:1')
+    return JsonResponse({'feed': feed, 'bulk': bulk, 'exists': exists})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n.includes("cache"))).toBe(false);
+  });
+
+  it("process-execution note fires for subprocess.run / Popen / call / check_output", () => {
+    const probes = [
+      { body: "subprocess.run(['wkhtmltopdf', '-', '-'], capture_output=True)", label: "subprocess.run" },
+      { body: "p = subprocess.Popen(['ffmpeg', '-i', 'in.mp4', 'out.mp3'])", label: "subprocess.Popen" },
+      { body: "subprocess.call(['ls', '-la'])", label: "subprocess.call" },
+      { body: "out = subprocess.check_output(['git', 'status'])", label: "subprocess.check_output" },
+      { body: "subprocess.check_call(['rsync', src, dest])", label: "subprocess.check_call" },
+      { body: "out = subprocess.getoutput('uname -a')", label: "subprocess.getoutput" },
+      { body: "status, out = subprocess.getstatusoutput('echo hi')", label: "subprocess.getstatusoutput" },
+    ];
+    for (const { body, label } of probes) {
+      const source = `
+def view(request):
+    ${body}
+    return JsonResponse({'ok': True})
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${label} should emit process-execution note`).toContain("Executes external process");
+    }
+  });
+
+  it("process-execution note fires for os.system / os.popen / os.exec* / os.spawn*", () => {
+    const probes = [
+      { body: "os.system('ls -la')", label: "os.system" },
+      { body: "f = os.popen('uname -a')", label: "os.popen" },
+      { body: "os.execl('/bin/sh', 'sh', '-c', 'echo hi')", label: "os.execl" },
+      { body: "os.execv('/bin/echo', ['echo', 'hi'])", label: "os.execv" },
+      { body: "os.execlp('echo', 'echo', 'hi')", label: "os.execlp" },
+      { body: "os.spawnl(os.P_WAIT, '/bin/echo', 'echo', 'hi')", label: "os.spawnl" },
+      { body: "os.spawnv(os.P_WAIT, '/bin/echo', ['echo', 'hi'])", label: "os.spawnv" },
+    ];
+    for (const { body, label } of probes) {
+      const source = `
+def view(request):
+    ${body}
+    return JsonResponse({'ok': True})
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${label} should emit process-execution note`).toContain("Executes external process");
+    }
+  });
+
+  it("process-execution note does NOT fire for subprocess.list2cmdline (helper, no spawn)", () => {
+    // subprocess.list2cmdline is a string-formatting utility that builds a
+    // Windows-shell-quoted command line. It spawns nothing. Should stay
+    // out of the side-effect list.
+    const source = `
+def view(request):
+    line = subprocess.list2cmdline(['ffmpeg', '-i', 'in.mp4', 'out.mp3'])
+    return JsonResponse({'cmd': line})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Executes external process")).toBe(false);
+  });
+});
+
+describe("parseDjango: Celery background-job notes", () => {
+  // Celery is the dominant async task library in Django; views that dispatch
+  // tasks are high-blast-radius because the real work (DB writes, email, file
+  // creation) happens later in a worker process, out of band with the request.
+  // Mirrors C# Hangfire (BackgroundJob.Enqueue) and Ruby ActiveJob
+  // (perform_later / perform_async) background-job notes.
+
+  it("surfaces 'Enqueues background job' for task.delay() dispatch (FBV)", () => {
+    const source = `
+def register(request):
+    user = User.objects.create(email=request.POST['email'])
+    send_welcome_email.delay(user.id)
+    return JsonResponse({'id': user.id})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Enqueues background job");
+  });
+
+  it("surfaces 'Enqueues background job' for task.apply_async() dispatch (CBV)", () => {
+    const source = `
+class CheckoutView(View):
+    def post(self, request):
+        order = Order.objects.create(user=request.user)
+        process_payment.apply_async(args=[order.id], countdown=5)
+        return JsonResponse({'order': order.id})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Enqueues background job");
+  });
+
+  it("pins both dispatch forms in isolation so a future regex narrowing trips a named failure", () => {
+    const probes = [
+      { body: "generate_report.delay(request.user.id)", label: ".delay(" },
+      { body: "export_data.apply_async(args=[pk], eta=eta)", label: ".apply_async(" },
+    ];
+    for (const { body, label } of probes) {
+      const source = `
+def view(request):
+    ${body}
+    return JsonResponse({'ok': True})
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${label} should emit background-job note`).toContain("Enqueues background job");
+    }
+  });
+
+  it("does NOT surface background-job note when neither .delay nor .apply_async is present", () => {
+    const source = `
+def index(request):
+    items = Item.objects.filter(active=True)
+    return JsonResponse({'count': items.count()})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Enqueues background job")).toBe(false);
+  });
+});
+
+describe("parseDjango: stored procedure notes (cursor.callproc)", () => {
+  // Python DB-API 2.0 defines cursor.callproc(procname, parameters) as the
+  // canonical API for invoking a stored procedure. Django views that drop to
+  // raw SQL via `with connection.cursor() as cursor: cursor.callproc(...)` are
+  // audit-critical: the proc may contain triggers, cross-table writes, and
+  // side effects invisible in the calling view. Mirrors C# CommandType.StoredProcedure,
+  // Java prepareCall / createStoredProcedureQuery / SimpleJdbcCall, and
+  // CFML <cfstoredproc> detection.
+
+  it("surfaces 'Calls stored procedure' for cursor.callproc in FBV", () => {
+    const source = `
+def run_report(request):
+    with connection.cursor() as cursor:
+        cursor.callproc('sp_generate_report', [request.GET.get('year')])
+        results = cursor.fetchall()
+    return JsonResponse({'rows': results})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Calls stored procedure");
+  });
+
+  it("surfaces 'Calls stored procedure' for cursor.callproc in CBV", () => {
+    const source = `
+class InvoiceView(View):
+    def post(self, request):
+        with connection.cursor() as cur:
+            cur.callproc('sp_create_invoice', [request.user.id])
+        return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Calls stored procedure");
+  });
+
+  it("does NOT surface stored-procedure note for plain cursor.execute with SQL", () => {
+    const source = `
+def list_orders(request):
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT id, total FROM orders WHERE status = %s', ['open'])
+        rows = cursor.fetchall()
+    return JsonResponse({'orders': rows})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Calls stored procedure")).toBe(false);
+  });
+});
+
+describe("parseDjango: message broker notes (Kombu / Pika)", () => {
+  // Four Python broker libraries cover the dominant Django patterns.
+  // All are audit-critical: published messages trigger downstream consumers
+  // whose side effects are invisible in the calling view.
+  //   - Pika (pure RabbitMQ Python client): channel.basic_publish(...)
+  //   - Kombu (AMQP abstraction): producer.publish(...)
+  //   - kafka-python: KafkaProducer(...) instantiation
+  //   - confluent-kafka: producer.produce(...)
+  // Mirrors Java JMS/AMQP/Kafka and C# MassTransit/Azure Service Bus notes.
+
+  it("surfaces 'Sends message to broker (Kombu / Pika)' for channel.basic_publish (Pika)", () => {
+    const source = `
+def create_order(request):
+    order = Order.objects.create(**request.POST)
+    connection = pika.BlockingConnection(pika.ConnectionParameters(host='rabbitmq'))
+    channel = connection.channel()
+    channel.basic_publish(exchange='', routing_key='orders', body=order.to_json())
+    connection.close()
+    return JsonResponse({'id': order.id}, status=201)
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Sends message to broker (Kombu / Pika)");
+  });
+
+  it("surfaces 'Sends message to broker (Kombu / Pika)' for producer.publish (Kombu)", () => {
+    const source = `
+def notify_subscribers(request):
+    with Connection(settings.BROKER_URL) as conn:
+        producer = conn.Producer()
+        producer.publish({'event': 'user_signup', 'id': request.user.id},
+                         exchange='events', routing_key='signup')
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Sends message to broker (Kombu / Pika)");
+  });
+
+  it("surfaces 'Sends message to broker (Kombu / Pika)' for KafkaProducer instantiation", () => {
+    const source = `
+def emit_event(request):
+    producer = KafkaProducer(bootstrap_servers=settings.KAFKA_BROKERS)
+    producer.send('user-events', key=b'signup', value=request.body)
+    producer.flush()
+    return HttpResponse(status=202)
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Sends message to broker (Kombu / Pika)");
+  });
+
+  it("surfaces 'Sends message to broker (Kombu / Pika)' for producer.produce (confluent-kafka)", () => {
+    const source = `
+def ship_order(request, pk):
+    order = get_object_or_404(Order, pk=pk)
+    order.status = 'shipped'
+    order.save()
+    producer = Producer({'bootstrap.servers': settings.KAFKA_BROKERS})
+    producer.produce('shipments', key=str(order.id), value=order.to_json())
+    producer.flush()
+    return JsonResponse({'status': 'shipped'})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Sends message to broker (Kombu / Pika)");
+  });
+
+  it("does NOT surface broker note for plain view with no broker calls", () => {
+    const source = `
+def list_orders(request):
+    orders = Order.objects.filter(user=request.user)
+    return JsonResponse({'orders': list(orders.values())})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n.startsWith("Sends message to broker"))).toBe(false);
   });
 });

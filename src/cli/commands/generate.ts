@@ -43,6 +43,21 @@ export interface GenerateOptions {
    *  the same source produce byte-identical output (enabling the
    *  outcome=unchanged path without relying on sub-millisecond timing). */
   now?: () => string;
+  /** Skip writing pages whose LLM-rated confidence is below this level.
+   *  "low" (default) writes everything; "medium" drops low-confidence pages;
+   *  "high" writes only high-confidence pages. */
+  minConfidence?: "high" | "medium" | "low";
+}
+
+const CONFIDENCE_ORDER: Record<string, number> = { high: 3, medium: 2, low: 1 };
+
+function meetsConfidenceThreshold(
+  confidence: string,
+  threshold: string,
+): boolean {
+  const pageLevel = CONFIDENCE_ORDER[confidence] ?? 1;
+  const minLevel = CONFIDENCE_ORDER[threshold] ?? 1;
+  return pageLevel >= minLevel;
 }
 
 export async function runGenerate(opts: GenerateOptions): Promise<void> {
@@ -51,7 +66,7 @@ export async function runGenerate(opts: GenerateOptions): Promise<void> {
   if (opts.limit && opts.limit > 0) config.maxCandidates = opts.limit;
 
   const projectName = path.basename(opts.cwd);
-  const candidates = await scanProject(opts.cwd, config);
+  let candidates = await scanProject(opts.cwd, config);
 
   let work = candidates;
   if (opts.only) {
@@ -203,6 +218,7 @@ export async function runGenerate(opts: GenerateOptions): Promise<void> {
   // exist (validSlugs set). Pass the set to renderUseCase so it can filter
   // related-use-case links.
   let written = 0;
+  let skipped = 0;
   for (const { candidate, useCase, retry } of extractions) {
     try {
       // Persist the chain-of-correction outcome BEFORE the generate
@@ -231,6 +247,33 @@ export async function runGenerate(opts: GenerateOptions): Promise<void> {
           signing,
         });
       }
+      // --min-confidence gate: skip pages below the threshold and emit a
+      // "skipped" audit entry so downstream tools can distinguish skipped
+      // from error. The threshold is "low" by default (write everything).
+      const threshold = opts.minConfidence ?? "low";
+      if (!meetsConfidenceThreshold(useCase.confidence, threshold)) {
+        console.log(
+          `  - ${useCase.slug} (skipped: confidence=${useCase.confidence} below --min-confidence=${threshold})`,
+        );
+        await appendAuditEntry(opts.cwd, {
+          operation: "generate",
+          commit,
+          page: useCase.slug,
+          outcome: "skipped",
+          details: {
+            source: candidate.relativePath,
+            lines: `${candidate.lineStart}-${candidate.lineEnd}`,
+            confidence: useCase.confidence,
+            skipReason: "below_min_confidence",
+            mock: usingMock,
+            promptVersion: PROMPT_VERSION,
+          },
+          signing,
+        });
+        skipped++;
+        continue;
+      }
+
       const md = renderUseCase(useCase, validSlugs);
       const outPath = path.join(
         opts.cwd,
@@ -284,8 +327,9 @@ export async function runGenerate(opts: GenerateOptions): Promise<void> {
     }
   }
 
+  const skippedSuffix = skipped > 0 ? `; skipped ${skipped} (below --min-confidence=${opts.minConfidence ?? "low"})` : "";
   console.log(
-    `[code2wiki] Wrote ${written} use case(s) to ${config.output}/`,
+    `[code2wiki] Wrote ${written} use case(s) to ${config.output}/${skippedSuffix}`,
   );
 }
 

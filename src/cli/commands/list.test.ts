@@ -314,3 +314,72 @@ describe("runList config respect", () => {
     expect(log.some((s) => s.includes("installed.cfc"))).toBe(false);
   });
 });
+
+const ASPX_WITH_HANDLERS = `<form runat="server">
+  <asp:Button ID="btnSubmit" runat="server" OnClick="btnSubmit_Click" Text="Submit" />
+  <asp:Button ID="btnCancel" runat="server" OnClick="btnCancel_Click" Text="Cancel" />
+</form>
+`;
+
+const ASPX_NO_HANDLERS = `<form runat="server">
+  <asp:Label ID="lblStatus" runat="server" Text="Status" />
+</form>
+`;
+
+describe("runList aspx-page companion line", () => {
+  it("does NOT emit a companion line for non-aspx candidates (cfml, java)", async () => {
+    await write("solo.cfc", ONE_FUNCTION_CFC);
+    await write("Hello.java", REST_CONTROLLER_JAVA);
+    const log = captureConsole();
+    await runList({ cwd: dir });
+    expect(log.some((s) => s.startsWith("       companion:"))).toBe(false);
+  });
+});
+
+describe("runList notes line", () => {
+  it("does NOT emit a notes line when a candidate has no notes", async () => {
+    await write("solo.cfc", ONE_FUNCTION_CFC);
+    const log = captureConsole();
+    await runList({ cwd: dir });
+    expect(log.some((s) => s.startsWith("       notes:"))).toBe(false);
+  });
+});
+
+const CFML_WITH_QUERY = `<cfcomponent>
+  <cffunction name="getOrders" access="public" returntype="query">
+    <cfquery name="q" datasource="ds">
+      SELECT o.id, o.status FROM orders o
+      JOIN customers c ON c.id = o.customer_id
+    </cfquery>
+    <cfreturn q>
+  </cffunction>
+</cfcomponent>
+`;
+
+describe("runList tables line", () => {
+  it("emits a tables line when a candidate has hints.databaseTables", async () => {
+    await write("Orders.cfc", CFML_WITH_QUERY);
+    const log = captureConsole();
+    await runList({ cwd: dir });
+    const tablesLine = log.find((s) => s.startsWith("       tables:"));
+    expect(tablesLine).toBeDefined();
+    expect(tablesLine).toContain("orders");
+    expect(tablesLine).toContain("customers");
+  });
+
+  it("joins multiple tables with commas on one line", async () => {
+    await write("Orders.cfc", CFML_WITH_QUERY);
+    const log = captureConsole();
+    await runList({ cwd: dir });
+    const tablesLine = log.find((s) => s.startsWith("       tables:"));
+    expect(tablesLine).toBeDefined();
+    expect(tablesLine).toMatch(/tables: \S+, \S+/);
+  });
+
+  it("does NOT emit a tables line when a candidate has no databaseTables", async () => {
+    await write("solo.cfc", ONE_FUNCTION_CFC);
+    const log = captureConsole();
+    await runList({ cwd: dir });
+    expect(log.some((s) => s.startsWith("       tables:"))).toBe(false);
+  });
+});

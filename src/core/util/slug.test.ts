@@ -24,6 +24,28 @@ describe("slugify", () => {
   it("returns empty string for empty input", () => {
     expect(slugify("")).toBe("");
   });
+
+  it("does not leave a trailing dash when the 80-char cap lands on a dash boundary", () => {
+    // Regression guard: if the trim-dashes step ran BEFORE the slice (the
+    // original order), an input that slugifies to "a-a-a-...-a-a" of 81+
+    // chars would cap at 80 and leave the boundary char as a dash. That
+    // trailing dash bleeds into stableId's
+    // `${language}-${path}-${fn}-v1` template, producing a visible
+    // "...-a--v1" double dash on the upsert key, which means a publisher
+    // either fails the upsert or creates a duplicate page.
+    //
+    // 41 single-letter words separated by spaces -> 81-char slug
+    // ("a-a-..-a", 41 a's + 40 dashes) -> slice(0,80) ends at index 79,
+    // which is a dash. The post-slice trim MUST remove it.
+    const input = "a ".repeat(41).trim();
+    const slug = slugify(input);
+    expect(slug.length).toBeLessThanOrEqual(80);
+    expect(slug).not.toMatch(/-$/);
+    // Sanity: the bug-fix preserves the slug content (just drops the
+    // dangling boundary dash). A 79-char "a-a-..-a" with 40 a's and 39
+    // dashes is the correct truncation.
+    expect(slug).toBe("a-".repeat(40).replace(/-$/, ""));
+  });
 });
 
 describe("stableId", () => {

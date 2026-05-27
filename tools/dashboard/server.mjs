@@ -548,7 +548,7 @@ function parseFrontmatter(md) {
 
 function renderWikiPage({ slug, exampleName, frontmatter, bodyHtml, hasActual, hasExpected, isActual, sourceMd }) {
   const fm = frontmatter;
-  const githubUrl = "https://github.com/aqlong/code2wiki";
+  const githubUrl = "https://github.com/craftandship/code2wiki";
   const repoLinkSrc = sourceMd
     ? sourceMd
         .split("\n")

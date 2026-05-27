@@ -128,22 +128,170 @@ class Api {
     expect(candidates[0]!.hints.httpRoute?.method).toBe("ANY");
   });
 
-  it("emits httpRoute.path as empty string (path lives in the raw source for the LLM)", () => {
-    // Documented design: the path arg is read by the LLM from the
-    // candidate's source field, NOT by the parser. The path field is
-    // intentionally "". A regression populating .path from the annotation
-    // arg without escaping quotes/parens would risk malformed prompts.
-    const source = `import org.springframework.stereotype.RestController;
-import org.springframework.web.bind.annotation.GetMapping;
+  it("extracts route path from @GetMapping(\"/template\") annotation argument", () => {
+    const source = `import org.springframework.web.bind.annotation.*;
 
 @RestController
 class Api {
     @GetMapping("/items/{id}")
-    public Object get() { return null; }
+    public Object getById(int id) { return null; }
+
+    @PostMapping("/items")
+    public Object create() { return null; }
+
+    @DeleteMapping("/items/{id}/tags/{tagId}")
+    public void removeTag(int id, int tagId) {}
+
+    @GetMapping
+    public Object list() { return null; }
 }
 `;
     const candidates = parseJava("/x/Api.java", "Api.java", source);
-    expect(candidates[0]!.hints.httpRoute?.path).toBe("");
+
+    const get = candidates.find((c) => c.name === "Api.getById")!;
+    expect(get.hints.httpRoute).toEqual({ method: "GET", path: "/items/{id}" });
+
+    const post = candidates.find((c) => c.name === "Api.create")!;
+    expect(post.hints.httpRoute).toEqual({ method: "POST", path: "/items" });
+
+    const del = candidates.find((c) => c.name === "Api.removeTag")!;
+    expect(del.hints.httpRoute).toEqual({ method: "DELETE", path: "/items/{id}/tags/{tagId}" });
+
+    // No argument: path stays empty string
+    const list = candidates.find((c) => c.name === "Api.list")!;
+    expect(list.hints.httpRoute).toEqual({ method: "GET", path: "" });
+  });
+
+  it("extracts route path from @RequestMapping(value = \"/path\") named argument", () => {
+    const source = `import org.springframework.web.bind.annotation.*;
+
+@RestController
+class LegacyApi {
+    @RequestMapping(value = "/legacy/users", method = RequestMethod.GET)
+    public Object getUsers() { return null; }
+
+    @RequestMapping(path = "/legacy/orders")
+    public Object getOrders() { return null; }
+}
+`;
+    const candidates = parseJava("/x/LegacyApi.java", "LegacyApi.java", source);
+    const users = candidates.find((c) => c.name === "LegacyApi.getUsers")!;
+    expect(users.hints.httpRoute?.path).toBe("/legacy/users");
+
+    const orders = candidates.find((c) => c.name === "LegacyApi.getOrders")!;
+    expect(orders.hints.httpRoute?.path).toBe("/legacy/orders");
+  });
+
+  it("prepends class-level @RequestMapping prefix to method-level route paths", () => {
+    // Spring REST controllers commonly have @RequestMapping("/api/v1") at the
+    // class level and verb-specific mappings at the method level. The combined
+    // route is /api/v1/users/{id}, not just /users/{id}. Without the prefix
+    // the LLM route hint is incomplete.
+    const source = `import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1")
+public class UserController {
+    @GetMapping("/users/{id}")
+    public Object getUser(int id) { return null; }
+
+    @PostMapping("/users")
+    public Object createUser() { return null; }
+
+    @GetMapping
+    public Object listAll() { return null; }
+}
+`;
+    const candidates = parseJava("/x/UserController.java", "UserController.java", source);
+
+    const get = candidates.find((c) => c.name === "UserController.getUser")!;
+    expect(get.hints.httpRoute).toEqual({ method: "GET", path: "/api/v1/users/{id}" });
+
+    const post = candidates.find((c) => c.name === "UserController.createUser")!;
+    expect(post.hints.httpRoute).toEqual({ method: "POST", path: "/api/v1/users" });
+
+    // No method path arg: prefix only
+    const list = candidates.find((c) => c.name === "UserController.listAll")!;
+    expect(list.hints.httpRoute).toEqual({ method: "GET", path: "/api/v1" });
+  });
+
+  it("prepends class-level JAX-RS @Path prefix to method-level @Path", () => {
+    const source = `import javax.ws.rs.*;
+
+@Path("/orders")
+public class OrderResource {
+    @GET
+    @Path("/{orderId}")
+    public Response getOrder(int orderId) { return null; }
+
+    @POST
+    public Response createOrder() { return null; }
+}
+`;
+    const candidates = parseJava("/x/OrderResource.java", "OrderResource.java", source);
+
+    const get = candidates.find((c) => c.name === "OrderResource.getOrder")!;
+    expect(get.hints.httpRoute).toEqual({ method: "GET", path: "/orders/{orderId}" });
+
+    const post = candidates.find((c) => c.name === "OrderResource.createOrder")!;
+    expect(post.hints.httpRoute).toEqual({ method: "POST", path: "/orders" });
+  });
+
+  // --- Auth annotation notes -------------------------------------------
+
+  it("surfaces Spring Security + JEE auth annotations as hints.notes", () => {
+    // @PreAuthorize / @Secured / @RolesAllowed signal restricted access.
+    // Bundling them into notes gives the LLM an unambiguous signal so it
+    // includes authorization context in the generated use-case page, instead
+    // of having to infer it from the raw annotations list.
+    const source = `import org.springframework.web.bind.annotation.*;
+import org.springframework.security.access.prepost.PreAuthorize;
+import javax.annotation.security.RolesAllowed;
+
+@RestController
+@RequestMapping("/api")
+public class AdminController {
+    @GetMapping("/reports")
+    @PreAuthorize("hasRole('ADMIN')")
+    public Object getReports() { return null; }
+
+    @DeleteMapping("/users/{id}")
+    @RolesAllowed("ADMIN")
+    public void deleteUser(int id) {}
+
+    @GetMapping("/public")
+    public Object publicEndpoint() { return null; }
+}
+`;
+    const candidates = parseJava("/x/AdminController.java", "AdminController.java", source);
+
+    const reports = candidates.find((c) => c.name === "AdminController.getReports")!;
+    expect(reports.hints.notes).toEqual(["auth: PreAuthorize"]);
+
+    const del = candidates.find((c) => c.name === "AdminController.deleteUser")!;
+    expect(del.hints.notes).toEqual(["auth: RolesAllowed"]);
+
+    // No auth annotation: notes should be absent (not an empty array)
+    const pub = candidates.find((c) => c.name === "AdminController.publicEndpoint")!;
+    expect(pub.hints.notes).toBeUndefined();
+  });
+
+  it("includes class-level auth annotation in notes when method inherits it", () => {
+    // @Secured on the class applies to all methods; it should appear in
+    // notes even when the method itself carries no auth annotation.
+    const source = `import org.springframework.web.bind.annotation.*;
+import org.springframework.security.access.annotation.Secured;
+
+@RestController
+@Secured("ROLE_USER")
+public class UserController {
+    @GetMapping("/profile")
+    public Object getProfile() { return null; }
+}
+`;
+    const candidates = parseJava("/x/UserController.java", "UserController.java", source);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]!.hints.notes).toEqual(["auth: Secured"]);
   });
 
   // --- Selection heuristic -----------------------------------------------
@@ -302,6 +450,86 @@ class Repeat {
     const callees = candidates[0]!.hints.callees ?? [];
     const logCount = callees.filter((c) => c === "log").length;
     expect(logCount).toBe(1);
+  });
+
+  it("filters JVM stdlib noise from callees (Stream/Optional/Object/logger)", () => {
+    // Without this filter, Stream-heavy methods fill the 30-cap with
+    // `stream`, `flatMap`, `collect`, `toList`, etc., pushing real business
+    // calls off the list. Filter keeps `findActive`, `toDto`, `isExpired`
+    // (the actual business signal) while dropping pipeline noise.
+    const source = `import org.springframework.stereotype.Service;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.util.List;
+import java.util.Optional;
+@Service
+class Reporter {
+    private static final Logger log = LoggerFactory.getLogger(Reporter.class);
+    public List<UserDto> report() {
+        log.debug("starting");
+        log.info("computing");
+        return findActive()
+            .stream()
+            .filter(u -> !u.isExpired())
+            .map(u -> toDto(u))
+            .sorted()
+            .distinct()
+            .collect(java.util.stream.Collectors.toList());
+    }
+    List<User> findActive() { return null; }
+    UserDto toDto(User u) { return null; }
+}
+`;
+    const candidates = parseJava("/x/Reporter.java", "Reporter.java", source);
+    const callees = candidates[0]!.hints.callees ?? [];
+    // Business signal stays.
+    expect(callees).toContain("findActive");
+    expect(callees).toContain("toDto");
+    expect(callees).toContain("isExpired");
+    // Stdlib noise gets dropped.
+    expect(callees).not.toContain("stream");
+    expect(callees).not.toContain("collect");
+    expect(callees).not.toContain("sorted");
+    expect(callees).not.toContain("distinct");
+    expect(callees).not.toContain("toList");
+    expect(callees).not.toContain("debug");
+    expect(callees).not.toContain("info");
+    // Note: `filter` and `map` are intentionally NOT filtered (too generic
+    // to safely exclude, business code commonly uses these names).
+  });
+
+  it("JAVA_STDLIB_METHODS covers every documented alternative (defends set-deletion drift)", () => {
+    // Each entry in the JAVA_STDLIB_METHODS set is filtered. A single-entry
+    // deletion would silently let that noise back into the callees hint.
+    // This loop calls each method as a bare invocation; if any one starts
+    // appearing in callees, the named-failure assertion identifies it.
+    const stdlibMethods = [
+      "equals", "hashCode", "toString", "getClass",
+      "stream", "parallelStream", "flatMap", "reduce", "collect",
+      "sorted", "distinct", "peek", "limit", "skip",
+      "findFirst", "findAny", "anyMatch", "allMatch", "noneMatch",
+      "toList", "toArray", "toSet", "toMap",
+      "ofNullable", "isPresent", "orElse", "orElseGet", "orElseThrow",
+      "ifPresent", "ifPresentOrElse",
+      "debug", "info", "warn", "error", "trace",
+      "isDebugEnabled", "isInfoEnabled", "isWarnEnabled", "isErrorEnabled", "isTraceEnabled",
+    ];
+    for (const m of stdlibMethods) {
+      const source = `import org.springframework.stereotype.Service;
+@Service
+class T${m} {
+    public void run() {
+        obj.${m}();
+        doBusinessThing();
+    }
+}
+`;
+      const cs = parseJava(`/x/T${m}.java`, `T${m}.java`, source);
+      const callees = cs[0]?.hints.callees ?? [];
+      expect(callees, `${m} should be filtered from callees`).not.toContain(m);
+      // Sanity: the business call still surfaces, proving the test fixture is exercising the filter (not a parser miss).
+      expect(callees, `${m} fixture should still surface doBusinessThing`).toContain("doBusinessThing");
+    }
   });
 
   it("caps callees at 30 entries (cost guardrail on prompt size)", () => {
@@ -1116,5 +1344,1086 @@ public class ReportService {
       "ReportService.generateReport",
       "ReportService.invalidateReport",
     ]);
+  });
+
+  it("skips static methods on @RestController classes (Spring cannot dispatch to static methods)", () => {
+    const source = `package com.example;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api")
+public class UserController {
+    @GetMapping("/users")
+    public List<User> list() { return service.findAll(); }
+
+    @GetMapping("/helper")
+    public static String staticHelper() { return "nope"; }
+
+    public static UserController of(UserService s) { return new UserController(s); }
+}
+`;
+    const candidates = parseJava(
+      "/x/UserController.java",
+      "UserController.java",
+      source,
+    );
+    const names = candidates.map((c) => c.name);
+    expect(names).toEqual(["UserController.list"]);
+    expect(names).not.toContain("UserController.staticHelper");
+    expect(names).not.toContain("UserController.of");
+  });
+});
+
+// ---- Spring Data repository extraction (databaseTables) -----------------
+
+describe("parseJava: JPA repository databaseTables hints", () => {
+  it("extracts a single model from an injected repository call", () => {
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/users")
+public class UserController {
+    private final UserRepository userRepository;
+
+    @GetMapping("/{id}")
+    public User get(Long id) {
+        return userRepository.findById(id).orElseThrow();
+    }
+}
+`;
+    const cs = parseJava("/x/UserController.java", "UserController.java", source);
+    expect(cs).toHaveLength(1);
+    expect(cs[0]?.hints.databaseTables).toEqual(["User"]);
+  });
+
+  it("extracts multiple distinct models from a single method", () => {
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/orders")
+public class OrderController {
+    @PostMapping
+    public Order place(OrderRequest req) {
+        User user = userRepository.findById(req.getUserId()).orElseThrow();
+        Product product = productRepository.findById(req.getProductId()).orElseThrow();
+        return orderRepository.save(new Order(user, product));
+    }
+}
+`;
+    const cs = parseJava("/x/OrderController.java", "OrderController.java", source);
+    expect(cs).toHaveLength(1);
+    expect(cs[0]?.hints.databaseTables).toEqual(
+      expect.arrayContaining(["User", "Product", "Order"]),
+    );
+    expect(cs[0]?.hints.databaseTables).toHaveLength(3);
+  });
+
+  it("deduplicates repeated calls to the same repository", () => {
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class ArticleController {
+    @GetMapping("/articles/{id}")
+    public Article get(Long id) {
+        Article article = articleRepository.findById(id).orElseThrow();
+        articleRepository.incrementViewCount(id);
+        return article;
+    }
+}
+`;
+    const cs = parseJava("/x/ArticleController.java", "ArticleController.java", source);
+    expect(cs[0]?.hints.databaseTables).toEqual(["Article"]);
+  });
+
+  it("handles this.repository prefix (constructor injection style)", () => {
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class PostController {
+    @GetMapping("/posts")
+    public List<Post> list() {
+        return this.postRepository.findAll();
+    }
+}
+`;
+    const cs = parseJava("/x/PostController.java", "PostController.java", source);
+    expect(cs[0]?.hints.databaseTables).toEqual(["Post"]);
+  });
+
+  it("leaves databaseTables undefined when no repository call is present", () => {
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class PingController {
+    @GetMapping("/ping")
+    public String ping() { return "pong"; }
+}
+`;
+    const cs = parseJava("/x/PingController.java", "PingController.java", source);
+    expect(cs[0]?.hints.databaseTables).toBeUndefined();
+  });
+});
+
+// ---- Side-effect notes (email, HTTP, events, messaging) ------------------
+
+describe("parseJava: side-effect notes", () => {
+  it("surfaces email note when JavaMailSender is referenced", () => {
+    const source = `package com.example;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class NotifyController {
+    private final JavaMailSender mailSender;
+    public NotifyController(JavaMailSender mailSender) { this.mailSender = mailSender; }
+
+    @PostMapping("/notify")
+    public String notify() {
+        SimpleMailMessage msg = new SimpleMailMessage();
+        msg.setTo("user@example.com");
+        mailSender.send(msg);
+        return "sent";
+    }
+}
+`;
+    const cs = parseJava("/x/NotifyController.java", "NotifyController.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Sends email")).toBe(true);
+  });
+
+  it("surfaces HTTP note when RestTemplate is referenced", () => {
+    const source = `package com.example;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class ProxyController {
+    private final RestTemplate restTemplate;
+    public ProxyController(RestTemplate restTemplate) { this.restTemplate = restTemplate; }
+
+    @GetMapping("/proxy")
+    public String proxy() {
+        return restTemplate.getForObject("https://api.example.com/data", String.class);
+    }
+}
+`;
+    const cs = parseJava("/x/ProxyController.java", "ProxyController.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Makes outbound HTTP request")).toBe(true);
+  });
+
+  it("surfaces Spring event note when publishEvent is called", () => {
+    const source = `package com.example;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class OrderController {
+    private final ApplicationEventPublisher publisher;
+    public OrderController(ApplicationEventPublisher publisher) { this.publisher = publisher; }
+
+    @PostMapping("/orders")
+    public String create() {
+        publisher.publishEvent(new OrderCreatedEvent());
+        return "ok";
+    }
+}
+`;
+    const cs = parseJava("/x/OrderController.java", "OrderController.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Publishes Spring application event")).toBe(true);
+  });
+
+  it("surfaces broker note when KafkaTemplate is used", () => {
+    const source = `package com.example;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class EventController {
+    private final KafkaTemplate<String, String> kafka;
+    public EventController(KafkaTemplate<String, String> kafka) { this.kafka = kafka; }
+
+    @PostMapping("/publish")
+    public String publish(@RequestBody String payload) {
+        kafka.send("events", payload);
+        return "ok";
+    }
+}
+`;
+    const cs = parseJava("/x/EventController.java", "EventController.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Sends message to broker (JMS, AMQP, or Kafka)")).toBe(true);
+  });
+
+  it("does not add side-effect notes for a plain controller", () => {
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class PingController {
+    @GetMapping("/ping")
+    public String ping() { return "pong"; }
+}
+`;
+    const cs = parseJava("/x/PingController.java", "PingController.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.every((n) =>
+      !n.includes("email") && !n.includes("HTTP") && !n.includes("event") && !n.includes("broker"),
+    )).toBe(true);
+  });
+});
+
+// ---- Side-effect note coverage (defensive per-alternative pins) ----------
+//
+// The 4 side-effect regexes at java.ts:271/275/279-281/285 collectively
+// enumerate ~24 alternatives (6 email + 7 HTTP + 3 event branches + 7
+// broker). The existing 5 side-effect tests above cover only one or two
+// alternatives per regex; the remainder is undefended. A refactor that
+// silently drops a single alternative (e.g. removing "WebClient" from the
+// HTTP alternation, or "JmsTemplate" from the broker alternation) would
+// degrade the load-bearing BLAST RADIUS / Notes signal for any controller
+// using ONLY that alternative -- a real customer mis-generation regression
+// decoupled from any test surface.
+//
+// Pattern mirrors the C# ACTION_RETURN_TYPES pin at csharp.test.ts (01e60b9)
+// and the Ruby AR_CLASS_METHODS pin at ruby.test.ts (ce63ba4): one it-block
+// per regex with a for-loop over the alternatives, each fixture isolated so
+// only that one alternative appears in methodSource. Each alternative
+// embedded in a string literal so the fixture stays parser-clean regardless
+// of whether the identifier is a Java type, field, or arbitrary token --
+// the regex matches at byte boundaries (\b is character-class-based), so a
+// string-literal embedding is equivalent to a bare reference for matching.
+
+describe("parseJava: side-effect notes (per-alternative coverage)", () => {
+  const buildFixture = (token: string) => `package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class TestCtl {
+    @GetMapping("/x")
+    public String x() {
+        String marker = "${token}";
+        return marker;
+    }
+}
+`;
+
+  it("email regex covers all 7 alternatives (type names + DI field names)", () => {
+    const alts = [
+      // Spring mail type names
+      "JavaMailSender",
+      "SimpleMailMessage",
+      "MimeMessage",
+      "MimeMessageHelper",
+      // camelCase DI field names (type hidden by constructor injection)
+      "mailSender",       // Spring docs default field name
+      "javaMailSender",   // matches Spring Boot auto-configured bean name
+      "emailSender",      // common Spring Boot developer preference
+    ];
+    for (const alt of alts) {
+      const cs = parseJava("/x/TestCtl.java", "TestCtl.java", buildFixture(alt));
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${alt} should emit "Sends email"`).toContain("Sends email");
+    }
+  });
+
+  it("HTTP regex covers all 13 alternatives (Spring, Java 11, OkHttp, Apache HttpClient)", () => {
+    // Pins every alternative in the HTTP detection OR-group. Each fixture
+    // injects exactly one token; a regression that drops an alternative fails
+    // the corresponding labeled expectation and names the missing token. Count
+    // went from 7 to 13 when OkHttp (OkHttpClient / okHttpClient), Apache
+    // HttpClient (CloseableHttpClient / HttpClientBuilder / closeableHttpClient),
+    // and the Java 11 HttpClient type name were added for legacy Java shops.
+    const alts = [
+      // Spring family
+      "RestTemplate",
+      "WebClient",
+      "FeignClient",
+      "restTemplate",
+      "webClient",
+      "feignClient",
+      // Java 11 HttpClient (type name + field name)
+      "HttpClient",
+      "httpClient",
+      // OkHttp (square/okhttp, popular in Android-adjacent Java backends)
+      "OkHttpClient",
+      "okHttpClient",
+      // Apache HttpClient (legacy Java shops, still common in pre-Spring-5 code)
+      "CloseableHttpClient",
+      "HttpClientBuilder",
+      "closeableHttpClient",
+    ];
+    for (const alt of alts) {
+      const cs = parseJava("/x/TestCtl.java", "TestCtl.java", buildFixture(alt));
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${alt} should emit "Makes outbound HTTP request"`).toContain("Makes outbound HTTP request");
+    }
+  });
+
+  it("Spring event branches cover all 3 patterns (method call + 2 token casings)", () => {
+    // Three independent OR branches: .publishEvent( method call,
+    // PascalCase ApplicationEventPublisher, camelCase
+    // applicationEventPublisher. Each fixture isolates exactly one
+    // branch: branch 1's "publisher.publishEvent(null)" token matches
+    // only the .publishEvent( regex (regex is case-sensitive, the bare
+    // word "publisher" doesn't collide with the Pascal/camel variants of
+    // applicationEventPublisher).
+    const probes = [
+      { token: "publisher.publishEvent(null)", label: ".publishEvent(" },
+      { token: "ApplicationEventPublisher", label: "ApplicationEventPublisher" },
+      { token: "applicationEventPublisher", label: "applicationEventPublisher" },
+    ];
+    for (const { token, label } of probes) {
+      const cs = parseJava("/x/TestCtl.java", "TestCtl.java", buildFixture(token));
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${label} should emit "Publishes Spring application event"`).toContain(
+        "Publishes Spring application event",
+      );
+    }
+  });
+
+  it("broker regex covers all 7 alternatives", () => {
+    const alts = [
+      "JmsTemplate",
+      "RabbitTemplate",
+      "KafkaTemplate",
+      "jmsTemplate",
+      "rabbitTemplate",
+      "kafkaTemplate",
+      "kafka",
+    ];
+    for (const alt of alts) {
+      const cs = parseJava("/x/TestCtl.java", "TestCtl.java", buildFixture(alt));
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${alt} should emit broker note`).toContain(
+        "Sends message to broker (JMS, AMQP, or Kafka)",
+      );
+    }
+  });
+
+  it("filesystem note fires for java.nio.Files mutators", () => {
+    const source = `package com.example;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class ExportController {
+    @PostMapping("/export")
+    public String export() throws Exception {
+        Files.write(Path.of("/tmp/report.csv"), buildCsv().getBytes());
+        return "ok";
+    }
+    String buildCsv() { return ""; }
+}
+`;
+    const cs = parseJava("/x/E.java", "E.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Writes to file system");
+  });
+
+  it("filesystem note fires for FileWriter and other java.io writer streams", () => {
+    const source = `package com.example;
+import java.io.FileWriter;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class LogController {
+    @PostMapping("/log")
+    public void appendLog(String entry) throws Exception {
+        try (FileWriter w = new FileWriter("/var/log/app.log", true)) {
+            w.write(entry);
+        }
+    }
+}
+`;
+    const cs = parseJava("/x/L.java", "L.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Writes to file system");
+  });
+
+  it("filesystem note fires for Spring multipart upload (MultipartFile.transferTo)", () => {
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+import java.io.File;
+
+@RestController
+public class UploadController {
+    @PostMapping("/upload")
+    public String upload(@RequestParam("file") MultipartFile file) throws Exception {
+        file.transferTo(new File("/uploads/" + file.getOriginalFilename()));
+        return "ok";
+    }
+}
+`;
+    const cs = parseJava("/x/U.java", "U.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Writes to file system");
+  });
+
+  it("filesystem note does NOT fire for read-only file operations", () => {
+    const source = `package com.example;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.io.FileReader;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class ImportController {
+    @GetMapping("/import")
+    public String load() throws Exception {
+        byte[] data = Files.readAllBytes(Path.of("/tmp/in.csv"));
+        FileReader r = new FileReader("/tmp/other.csv");
+        return new String(data);
+    }
+}
+`;
+    const cs = parseJava("/x/I.java", "I.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Writes to file system")).toBe(false);
+  });
+
+  it("Files.X mutator regex covers all 9 alternatives", () => {
+    // Each Files.X mutator is independently pinned so a regression
+    // narrowing the alternation list names the broken method.
+    const mutators = [
+      "write", "delete", "deleteIfExists", "move", "copy",
+      "createDirectories", "createDirectory", "createFile",
+      "createTempFile", "createTempDirectory",
+    ];
+    for (const m of mutators) {
+      const source = `package com.example;
+import java.nio.file.Files;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class T${m} {
+    @PostMapping("/op")
+    public void op() throws Exception {
+        Files.${m}(arg);
+    }
+}
+`;
+      const cs = parseJava(`/x/T${m}.java`, `T${m}.java`, source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `Files.${m} should emit filesystem note`).toContain("Writes to file system");
+    }
+  });
+
+  it("writer/stream regex covers all 5 java.io writer types", () => {
+    const writerTypes = [
+      "FileWriter", "FileOutputStream", "BufferedWriter", "PrintWriter", "OutputStreamWriter",
+    ];
+    for (const w of writerTypes) {
+      const source = `package com.example;
+import java.io.${w};
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class T_${w} {
+    @PostMapping("/op")
+    public void op() throws Exception {
+        ${w} writer = null;
+    }
+}
+`;
+      const cs = parseJava(`/x/T_${w}.java`, `T_${w}.java`, source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${w} should emit filesystem note`).toContain("Writes to file system");
+    }
+  });
+
+  it("transaction note fires for method-level @Transactional", () => {
+    const source = `package com.example;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class OrderService {
+    @Transactional
+    public void placeOrder(Long userId) {
+        // ... mutate orders + line_items + inventory atomically
+    }
+}
+`;
+    const cs = parseJava("/x/OrderService.java", "OrderService.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Executes within a database transaction (@Transactional)");
+  });
+
+  it("transaction note fires for class-level @Transactional (applies to all methods)", () => {
+    const source = `package com.example;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+@Transactional
+public class CheckoutService {
+    public void checkout(Long cartId) {
+        // class-level @Transactional applies
+    }
+    public void refund(Long orderId) {
+        // class-level @Transactional applies here too
+    }
+}
+`;
+    const cs = parseJava("/x/CheckoutService.java", "CheckoutService.java", source);
+    expect(cs).toHaveLength(2);
+    for (const candidate of cs) {
+      const notes = candidate.hints.notes ?? [];
+      expect(notes, `${candidate.name} should emit @Transactional note`).toContain(
+        "Executes within a database transaction (@Transactional)",
+      );
+    }
+  });
+
+  it("transaction note fires for Java EE @TransactionAttribute", () => {
+    const source = `package com.example;
+import javax.ejb.Stateless;
+import javax.ejb.TransactionAttribute;
+import javax.ejb.TransactionAttributeType;
+
+@Stateless
+public class InvoiceBean {
+    @TransactionAttribute(TransactionAttributeType.REQUIRED)
+    public void issueInvoice(Long orderId) { }
+}
+`;
+    const cs = parseJava("/x/InvoiceBean.java", "InvoiceBean.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Executes within a database transaction (@Transactional)");
+  });
+
+  it("transaction note does NOT fire for plain non-transactional methods", () => {
+    const source = `package com.example;
+import org.springframework.stereotype.Service;
+
+@Service
+public class PingService {
+    public String ping() { return "pong"; }
+}
+`;
+    const cs = parseJava("/x/P.java", "P.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n.includes("transaction"))).toBe(false);
+  });
+
+  it("JAVA_TRANSACTION_ANNOTATIONS covers all 2 alternatives", () => {
+    const variants = ["Transactional", "TransactionAttribute"];
+    for (const v of variants) {
+      const source = `package com.example;
+import org.springframework.stereotype.Service;
+@Service
+public class T_${v} {
+    @${v}
+    public void op() { }
+}
+`;
+      const cs = parseJava(`/x/T_${v}.java`, `T_${v}.java`, source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `@${v} should emit transaction note`).toContain(
+        "Executes within a database transaction (@Transactional)",
+      );
+    }
+  });
+
+  it("transaction note fires for programmatic TransactionTemplate.execute", () => {
+    const source = `package com.example;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
+
+@Service
+public class OrderService {
+    private final TransactionTemplate transactionTemplate;
+
+    public void processOrder(Order order) {
+        transactionTemplate.execute(status -> {
+            orderRepo.save(order);
+            inventoryService.reserve(order.getItems());
+            return null;
+        });
+    }
+}
+`;
+    const cs = parseJava("/x/OrderService.java", "OrderService.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Executes within a database transaction (TransactionTemplate)");
+  });
+
+  it("transaction note fires for PlatformTransactionManager (type visible in method body)", () => {
+    // PlatformTransactionManager is the lower-level Spring transaction API.
+    // Detected when the type name appears as a local variable or parameter
+    // type inside the method (e.g., fetched from context, or passed in).
+    const source = `package com.example;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.DefaultTransactionDefinition;
+
+@Service
+public class LegacyService {
+    private final ApplicationContext ctx;
+
+    public void transfer(long from, long to, long amount) {
+        PlatformTransactionManager txManager = ctx.getBean(PlatformTransactionManager.class);
+        TransactionStatus status = txManager.getTransaction(new DefaultTransactionDefinition());
+        try {
+            debitAccount(from, amount);
+            creditAccount(to, amount);
+            txManager.commit(status);
+        } catch (Exception e) {
+            txManager.rollback(status);
+            throw e;
+        }
+    }
+}
+`;
+    const cs = parseJava("/x/LegacyService.java", "LegacyService.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Executes within a database transaction (TransactionTemplate)");
+  });
+
+  it("cache-mutation note fires for @CacheEvict", () => {
+    const source = `package com.example;
+import org.springframework.stereotype.Service;
+import org.springframework.cache.annotation.CacheEvict;
+
+@Service
+public class UserService {
+    @CacheEvict(value = "users", allEntries = true)
+    public void rebuild() {
+        // ...
+    }
+}
+`;
+    const cs = parseJava("/x/U.java", "U.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Mutates application cache (@CacheEvict / @CachePut)");
+  });
+
+  it("cache-mutation note fires for @CachePut", () => {
+    const source = `package com.example;
+import org.springframework.stereotype.Service;
+import org.springframework.cache.annotation.CachePut;
+
+@Service
+public class ProductService {
+    @CachePut(value = "products", key = "#p.id")
+    public Product save(Product p) {
+        return p;
+    }
+}
+`;
+    const cs = parseJava("/x/P.java", "P.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Mutates application cache (@CacheEvict / @CachePut)");
+  });
+
+  it("cache-mutation note does NOT fire for @Cacheable (read-on-miss only)", () => {
+    // @Cacheable only writes on cache miss (read-through pattern). Low blast
+    // radius compared to @CacheEvict / @CachePut. Intentionally excluded so
+    // the note doesn't dilute compliance signal.
+    const source = `package com.example;
+import org.springframework.stereotype.Service;
+import org.springframework.cache.annotation.Cacheable;
+
+@Service
+public class ReadOnlyService {
+    @Cacheable("users")
+    public User findById(Long id) {
+        return null;
+    }
+}
+`;
+    const cs = parseJava("/x/R.java", "R.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n.includes("cache"))).toBe(false);
+  });
+
+  it("JAVA_CACHE_MUTATION_ANNOTATIONS covers all 2 alternatives", () => {
+    const variants = ["CacheEvict", "CachePut"];
+    for (const v of variants) {
+      const source = `package com.example;
+import org.springframework.stereotype.Service;
+@Service
+public class T_${v} {
+    @${v}("x")
+    public void op() { }
+}
+`;
+      const cs = parseJava(`/x/T_${v}.java`, `T_${v}.java`, source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `@${v} should emit cache-mutation note`).toContain(
+        "Mutates application cache (@CacheEvict / @CachePut)",
+      );
+    }
+  });
+
+  it("process-execution note fires for Runtime.getRuntime().exec(...)", () => {
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class PdfController {
+    @PostMapping("/render")
+    public byte[] render(String html) throws Exception {
+        Process p = Runtime.getRuntime().exec(new String[]{"wkhtmltopdf", "-", "-"});
+        return p.getInputStream().readAllBytes();
+    }
+}
+`;
+    const cs = parseJava("/x/P.java", "P.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Executes external process");
+  });
+
+  it("process-execution note fires for ProcessBuilder", () => {
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+import java.io.File;
+
+@RestController
+public class ConvertController {
+    @PostMapping("/convert")
+    public String convert() throws Exception {
+        ProcessBuilder pb = new ProcessBuilder("ffmpeg", "-i", "in.mp4", "out.mp3");
+        pb.redirectErrorStream(true);
+        pb.start();
+        return "ok";
+    }
+}
+`;
+    const cs = parseJava("/x/C.java", "C.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Executes external process");
+  });
+
+  it("process-execution note does NOT fire for ProcessHandle introspection or plain controllers", () => {
+    // ProcessHandle.current() inspects the JVM's own process; it does NOT
+    // spawn anything. Should stay out of the side-effect list.
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class PingController {
+    @GetMapping("/pid")
+    public long pid() {
+        return ProcessHandle.current().pid();
+    }
+
+    @GetMapping("/ping")
+    public String ping() {
+        return "pong";
+    }
+}
+`;
+    const cs = parseJava("/x/P.java", "P.java", source);
+    for (const candidate of cs) {
+      const notes = candidate.hints.notes ?? [];
+      expect(notes.some((n) => n === "Executes external process")).toBe(false);
+    }
+  });
+});
+
+describe("parseJava: background-job notes (@Async / TaskExecutor / CompletableFuture)", () => {
+  // Spring Boot and Java 8+ offer three canonical fire-and-forget patterns;
+  // all three are audit-critical because downstream effects happen in a worker
+  // thread, out of band with the current request. Mirrors C# Hangfire
+  // (BackgroundJob.Enqueue), Ruby ActiveJob (perform_later / perform_async),
+  // and Django Celery (.delay / .apply_async).
+
+  it("surfaces background-job note for @Async-annotated method", () => {
+    const source = `package com.example;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class ReportController {
+    @Async
+    @PostMapping("/reports")
+    public void generateReport(String id) {
+        buildReport(id);
+    }
+    void buildReport(String id) {}
+}
+`;
+    const cs = parseJava("/x/R.java", "R.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Enqueues background job");
+  });
+
+  it("surfaces background-job note for CompletableFuture.runAsync dispatch", () => {
+    const source = `package com.example;
+import java.util.concurrent.CompletableFuture;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class ExportController {
+    @PostMapping("/export")
+    public String export() {
+        CompletableFuture.runAsync(() -> buildAndUploadReport());
+        return "accepted";
+    }
+    void buildAndUploadReport() {}
+}
+`;
+    const cs = parseJava("/x/E.java", "E.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Enqueues background job");
+  });
+
+  it("surfaces background-job note for CompletableFuture.supplyAsync dispatch", () => {
+    const source = `package com.example;
+import java.util.concurrent.CompletableFuture;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class PricingController {
+    @GetMapping("/price")
+    public CompletableFuture<String> price() {
+        return CompletableFuture.supplyAsync(() -> fetchPrice());
+    }
+    String fetchPrice() { return ""; }
+}
+`;
+    const cs = parseJava("/x/P.java", "P.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Enqueues background job");
+  });
+
+  it("surfaces background-job note for TaskExecutor.execute dispatch", () => {
+    const source = `package com.example;
+import org.springframework.core.task.TaskExecutor;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class JobController {
+    private final TaskExecutor taskExecutor;
+
+    @PostMapping("/jobs")
+    public String enqueue() {
+        taskExecutor.execute(() -> runBatchJob());
+        return "queued";
+    }
+    void runBatchJob() {}
+}
+`;
+    const cs = parseJava("/x/J.java", "J.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Enqueues background job");
+  });
+
+  it("pins all three detection alternatives in isolation", () => {
+    const probes = [
+      {
+        label: "@Async annotation",
+        source: `package com.example;
+import org.springframework.scheduling.annotation.Async;
+@org.springframework.web.bind.annotation.RestController
+public class C {
+    @Async @org.springframework.web.bind.annotation.PostMapping("/x")
+    public void go() { doWork(); }
+    void doWork() {}
+}`,
+      },
+      {
+        label: "CompletableFuture.runAsync",
+        source: `package com.example;
+import java.util.concurrent.CompletableFuture;
+@org.springframework.web.bind.annotation.RestController
+public class C {
+    @org.springframework.web.bind.annotation.PostMapping("/x")
+    public String go() { CompletableFuture.runAsync(() -> work()); return "ok"; }
+    void work() {}
+}`,
+      },
+      {
+        label: "CompletableFuture.supplyAsync",
+        source: `package com.example;
+import java.util.concurrent.CompletableFuture;
+@org.springframework.web.bind.annotation.RestController
+public class C {
+    @org.springframework.web.bind.annotation.GetMapping("/x")
+    public CompletableFuture<String> go() { return CompletableFuture.supplyAsync(() -> "v"); }
+}`,
+      },
+      {
+        label: "taskExecutor.execute",
+        source: `package com.example;
+import org.springframework.core.task.TaskExecutor;
+@org.springframework.web.bind.annotation.RestController
+public class C {
+    private final TaskExecutor taskExecutor;
+    @org.springframework.web.bind.annotation.PostMapping("/x")
+    public String go() { taskExecutor.execute(() -> run()); return "ok"; }
+    void run() {}
+}`,
+      },
+    ];
+    for (const { label, source } of probes) {
+      const cs = parseJava("/x/C.java", "C.java", source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${label} should emit background-job note`).toContain(
+        "Enqueues background job",
+      );
+    }
+  });
+
+  it("does NOT surface background-job note when no async dispatch is present", () => {
+    const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class PingController {
+    @GetMapping("/ping")
+    public String ping() {
+        return "pong";
+    }
+}
+`;
+    const cs = parseJava("/x/P.java", "P.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Enqueues background job")).toBe(false);
+  });
+});
+
+describe("parseJava: stored procedure notes (JPA / JDBC / SimpleJdbcCall)", () => {
+  // Stored procs may have side effects invisible in the Java code (triggers,
+  // cross-table writes, audit logging in the DB layer), so compliance readers
+  // need them surfaced as business rules. Mirrors CFML's <cfstoredproc> note
+  // and C#'s CommandType.StoredProcedure note.
+
+  it("surfaces stored-procedure note for JPA EntityManager.createStoredProcedureQuery", () => {
+    const source = `package com.example;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.StoredProcedureQuery;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class ReportController {
+    private final EntityManager em;
+
+    @PostMapping("/reports/{id}")
+    public String run(@PathVariable Long id) {
+        StoredProcedureQuery q = em.createStoredProcedureQuery("sp_GenerateReport");
+        q.registerStoredProcedureParameter(1, Long.class, ParameterMode.IN);
+        q.setParameter(1, id);
+        q.execute();
+        return "ok";
+    }
+}
+`;
+    const cs = parseJava("/x/R.java", "R.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Calls stored procedure");
+  });
+
+  it("surfaces stored-procedure note for JDBC Connection.prepareCall", () => {
+    const source = `package com.example;
+import java.sql.CallableStatement;
+import java.sql.Connection;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class OrderController {
+    private final Connection conn;
+
+    @PostMapping("/orders/fulfill")
+    public String fulfill(Long orderId) throws Exception {
+        try (CallableStatement cs = conn.prepareCall("{ call sp_FulfillOrder(?) }")) {
+            cs.setLong(1, orderId);
+            cs.execute();
+        }
+        return "ok";
+    }
+}
+`;
+    const cs = parseJava("/x/O.java", "O.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Calls stored procedure");
+  });
+
+  it("surfaces stored-procedure note for Spring SimpleJdbcCall", () => {
+    const source = `package com.example;
+import org.springframework.jdbc.core.simple.SimpleJdbcCall;
+import org.springframework.web.bind.annotation.*;
+import javax.sql.DataSource;
+import java.util.Map;
+
+@RestController
+public class CleanupController {
+    private final DataSource ds;
+
+    @PostMapping("/cleanup")
+    public String run() {
+        SimpleJdbcCall call = new SimpleJdbcCall(ds).withProcedureName("sp_PurgeExpiredSessions");
+        Map<String, Object> result = call.execute();
+        return "ok";
+    }
+}
+`;
+    const cs = parseJava("/x/C.java", "C.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes).toContain("Calls stored procedure");
+  });
+
+  it("pins all three detection alternatives in isolation", () => {
+    const probes = [
+      {
+        label: "createStoredProcedureQuery (JPA)",
+        body: `em.createStoredProcedureQuery("sp_x").execute();`,
+      },
+      {
+        label: "prepareCall (JDBC)",
+        body: `conn.prepareCall("{ call sp_x(?) }").execute();`,
+      },
+      {
+        label: "SimpleJdbcCall (Spring)",
+        body: `new SimpleJdbcCall(ds).withProcedureName("sp_x").execute();`,
+      },
+    ];
+    for (const { label, body } of probes) {
+      const source = `package com.example;
+import org.springframework.web.bind.annotation.*;
+@RestController
+public class C {
+    @PostMapping("/x")
+    public String go() throws Exception { ${body} return "ok"; }
+}`;
+      const cs = parseJava("/x/C.java", "C.java", source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${label} should emit stored-procedure note`).toContain(
+        "Calls stored procedure",
+      );
+    }
+  });
+
+  it("does NOT surface stored-procedure note for plain SQL queries", () => {
+    const source = `package com.example;
+import jakarta.persistence.EntityManager;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class ProductController {
+    private final EntityManager em;
+
+    @GetMapping("/products")
+    public String list() {
+        return em.createQuery("SELECT p FROM Product p").getResultList().toString();
+    }
+}
+`;
+    const cs = parseJava("/x/P.java", "P.java", source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Calls stored procedure")).toBe(false);
   });
 });

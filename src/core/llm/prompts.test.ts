@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { buildUserPrompt, PROMPT_VERSION, SYSTEM_PROMPT } from "./prompts.js";
+import { COMPLIANCE_NOTE_PREFIXES } from "../feedback/validator.js";
 import type { Candidate, CandidateHints } from "../types.js";
 
 /**
@@ -16,10 +17,10 @@ import type { Candidate, CandidateHints } from "../types.js";
  *     system-prompt boundary (everything below the system prompt is the
  *     dynamic half; the LLM cache hit relies on the shape staying
  *     identical run-to-run for the SAME source file).
- *  2. Fence-language selection: `cfml` for CFML, `java` for everything
- *     else (including `unknown`). A regression dropping the cfml branch
- *     would emit `\`\`\`java` for .cfc source, degrading the LLM's
- *     syntax-aware tokenization of CFML tags.
+ *  2. Fence-language selection: `coldfusion` for CFML, `csharp` for C#,
+ *     `python`/`ruby` for those languages, `java` for everything else
+ *     (including `unknown`). These map to highlight.js language aliases
+ *     used by `code2wiki preview` HTML output.
  *  3. Parser-hints block is fully omitted when no hint fields are
  *     populated. A regression emitting an empty `## Parser hints\n`
  *     stub burns tokens AND leaks a trailing blank line that varies
@@ -74,6 +75,7 @@ async function makeCandidate(opts: {
   lineStart?: number;
   lineEnd?: number;
   filePath?: string;
+  companionSources?: Candidate["companionSources"];
 }): Promise<Candidate> {
   const relativePath = opts.relativePath ?? "src/Foo.java";
   let filePath = opts.filePath;
@@ -94,6 +96,7 @@ async function makeCandidate(opts: {
     lineEnd: opts.lineEnd ?? 20,
     source: opts.source ?? 'public String bar() { return "hi"; }',
     hints: opts.hints ?? {},
+    companionSources: opts.companionSources,
   };
 }
 
@@ -118,29 +121,37 @@ describe("buildUserPrompt", () => {
   });
 
   describe("fence language", () => {
-    it("emits ```cfml fences for cfml candidates", async () => {
+    it("emits ```coldfusion fences for cfml candidates", async () => {
       const c = await makeCandidate({
         language: "cfml",
         source: "<cffunction />",
         relativePath: "foo.cfc",
       });
       const out = buildUserPrompt(c, "demo");
-      expect(out).toContain("```cfml");
+      expect(out).toContain("```coldfusion");
       expect(out).not.toContain("```java");
+      expect(out).not.toContain("```cfml");
     });
 
     it("emits ```java fences for java candidates", async () => {
       const c = await makeCandidate({ language: "java" });
       const out = buildUserPrompt(c, "demo");
       expect(out).toContain("```java");
-      expect(out).not.toContain("```cfml");
+      expect(out).not.toContain("```coldfusion");
+    });
+
+    it("emits ```csharp fences for csharp candidates", async () => {
+      const c = await makeCandidate({ language: "csharp" });
+      const out = buildUserPrompt(c, "demo");
+      expect(out).toContain("```csharp");
+      expect(out).not.toContain("```java");
     });
 
     it("emits ```java fences for unknown-language candidates (default fallback)", async () => {
       const c = await makeCandidate({ language: "unknown" });
       const out = buildUserPrompt(c, "demo");
       expect(out).toContain("```java");
-      expect(out).not.toContain("```cfml");
+      expect(out).not.toContain("```coldfusion");
     });
   });
 
@@ -216,18 +227,52 @@ describe("buildUserPrompt", () => {
       expect(out).toContain("DB tables touched: users, orders, audit_log");
     });
 
-    it("joins notes with '; ' (semicolon-space), NOT comma; preserves note text containing commas", async () => {
+    it("bullet-formats notes (one per line, '- ' prefix) so colon-bearing entries stay parseable", async () => {
       const c = await makeCandidate({
-        hints: { notes: ["uses announceEvent", "scope=public, all sites"] },
+        hints: {
+          notes: [
+            "uses announceEvent",
+            "scope=public, all sites",
+            "Calls stored procedure(s): sp_GetOrders",
+          ],
+        },
       });
       const out = buildUserPrompt(c, "demo");
+      // Each note on its own bulleted line; preserves notes that contain commas
+      // and notes whose body has an embedded colon.
       expect(out).toContain(
-        "Notes: uses announceEvent; scope=public, all sites",
+        "Notes:\n- uses announceEvent\n- scope=public, all sites\n- Calls stored procedure(s): sp_GetOrders",
       );
+      // Defensive: no semicolon-joined fallback.
+      expect(out).not.toContain("uses announceEvent; scope=public");
     });
 
-    it("emits hint kinds in a stable order: annotations → httpRoute → parameters → callees → databaseTables → notes", async () => {
+    it("emits handlerNames comma-joined as 'Handler names:' for aspx-page candidates", async () => {
       const c = await makeCandidate({
+        kind: "aspx-page",
+        language: "csharp",
+        hints: {},
+      });
+      c.handlerNames = ["btnSubmit_Click", "ddl_SelectedIndexChanged"];
+      const out = buildUserPrompt(c, "shop");
+      expect(out).toContain("## Parser hints");
+      expect(out).toContain("Handler names: btnSubmit_Click, ddl_SelectedIndexChanged");
+    });
+
+    it("omits 'Handler names:' line when handlerNames is absent or empty", async () => {
+      const withEmpty = await makeCandidate({ hints: {} });
+      withEmpty.handlerNames = [];
+      const withAbsent = await makeCandidate({ hints: {} });
+      for (const c of [withEmpty, withAbsent]) {
+        const out = buildUserPrompt(c, "demo");
+        expect(out).not.toContain("Handler names:");
+      }
+    });
+
+    it("emits hint kinds in a stable order: annotations → httpRoute → parameters → callees → databaseTables → handlerNames → notes", async () => {
+      const c = await makeCandidate({
+        kind: "aspx-page",
+        language: "csharp",
         hints: {
           notes: ["n"],
           databaseTables: ["t"],
@@ -237,6 +282,7 @@ describe("buildUserPrompt", () => {
           annotations: ["A"],
         },
       });
+      c.handlerNames = ["btn_Click"];
       const out = buildUserPrompt(c, "demo");
       const order = [
         "Annotations:",
@@ -244,6 +290,7 @@ describe("buildUserPrompt", () => {
         "Parameters:",
         "Calls:",
         "DB tables touched:",
+        "Handler names:",
         "Notes:",
       ];
       let prev = -1;
@@ -302,6 +349,40 @@ describe("buildUserPrompt", () => {
       expect(out).not.toContain("## Full source file (for cross-region context)");
       // sanity: the focus-region source still ships in the Focus region block
       expect(out).toContain("line 100");
+    });
+
+    it("omits the full-file section when the focus region spans the whole file (aspx-page / cfm page-level)", async () => {
+      // aspx-page and cfm page-level candidates set lineStart=1,
+      // lineEnd=totalLines. Including a full-file block would be identical
+      // to the focus-region block, doubling token cost and emitting the
+      // misleading "use the rest of the file" instruction when there IS no
+      // rest. The focus-region block alone is enough context.
+      const fullFile = ["<form runat='server'>", "  <asp:Button runat='server' />", "</form>"].join("\n");
+      const c = await makeCandidate({
+        fullFile,
+        source: fullFile,
+        lineStart: 1,
+        lineEnd: 3,
+      });
+      const out = buildUserPrompt(c, "demo");
+      expect(out).not.toContain("## Full source file (for cross-region context)");
+      // Focus-region source still emitted.
+      expect(out).toContain(fullFile);
+    });
+
+    it("includes the full-file section when focus is a sub-region of a whole-file-spanning candidate (lineEnd < totalLines)", async () => {
+      // Regression guard: spansWholeFile must check BOTH lineStart===1 AND
+      // lineEnd>=lineCount-1. A candidate starting at line 1 but ending at
+      // line 1 of a 3-line file should still get the full-file context block.
+      const fullFile = ["line 1", "line 2", "line 3"].join("\n");
+      const c = await makeCandidate({
+        fullFile,
+        source: "line 1",
+        lineStart: 1,
+        lineEnd: 1,
+      });
+      const out = buildUserPrompt(c, "demo");
+      expect(out).toContain("## Full source file (for cross-region context)");
     });
 
     it("gracefully omits the full-file section when filePath does not exist (degrades to region-only)", async () => {
@@ -420,5 +501,29 @@ describe("SYSTEM_PROMPT", () => {
     expect(SYSTEM_PROMPT).toContain("ACTOR");
     expect(SYSTEM_PROMPT).toContain("BLAST RADIUS");
     expect(SYSTEM_PROMPT).toContain("OUTPUT FORMAT");
+  });
+
+  it("mentions every COMPLIANCE_NOTE_PREFIXES entry verbatim (parser-prompt-validator three-way contract)", () => {
+    // The parser emits notes like "Sends email (ActionMailer)"; the prompt's
+    // BLAST RADIUS section instructs the LLM to surface them as business
+    // rules; the validator's NOTE_KEYWORDS map watches the LLM output for
+    // the same prefixes and warns when a compliance signal silently drops.
+    //
+    // The three sides only stay in sync by convention. A future prompt
+    // simplification that drops "Sends message to broker" from BLAST RADIUS
+    // without also pruning NOTE_KEYWORDS would leave the validator warning
+    // about un-surfaced notes the LLM was no longer instructed to surface,
+    // and vice versa for a new validator category forgotten in the prompt.
+    // This pin closes the loop by failing the build any time the prompt
+    // and validator drift apart on the prefix list.
+    //
+    // Per-prefix assertion (not a single bulk match) so a regression names
+    // exactly which category went missing.
+    for (const prefix of COMPLIANCE_NOTE_PREFIXES) {
+      expect(
+        SYSTEM_PROMPT,
+        `SYSTEM_PROMPT must mention compliance-note prefix "${prefix}" (validator's NOTE_KEYWORDS watches it; the prompt must instruct the LLM to surface it)`,
+      ).toContain(prefix);
+    }
   });
 });

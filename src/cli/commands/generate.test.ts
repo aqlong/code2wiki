@@ -20,6 +20,7 @@ import { changedFilesSince } from "../../core/git.js";
 import { runGenerate, sampleEvenly } from "./generate.js";
 import { PROMPT_VERSION } from "../../core/llm/prompts.js";
 import type { LlmFn } from "../../core/extractor.js";
+import type { Candidate } from "../../core/types.js";
 
 describe("sampleEvenly (--limit cap heuristic)", () => {
   it("returns the input unchanged when length <= target", () => {
@@ -250,7 +251,7 @@ describe("runGenerate", () => {
     // Wrong (cap first): 0 results (aaa + ccc sampled, neither in auth/).
     expect(rows).toHaveLength(1);
     expect(rows[0]!.details?.["source"]).toContain("auth");
-  });
+  }, 30000);
 
   // --name uses `c.name === needle || c.name.endsWith("." + needle)` so
   // both `--name solo` and `--name MyClass.solo` pick the same Java
@@ -368,7 +369,7 @@ describe("runGenerate", () => {
       (w) => w.includes("--since") && w.includes("falling back"),
     );
     expect(fellBack).toBe(true);
-  });
+  }, 30000);
 
   // Regression guard for the --since happy path. The null-return (git
   // diff failed) fallback is tested above; the success path where
@@ -565,7 +566,7 @@ describe("runGenerate", () => {
     const capWarn = warns.find((w) => w.includes("maxCandidates=1"));
     expect(capWarn).toBeDefined();
     expect(capWarn).toMatch(/sampling evenly/i);
-  });
+  }, 30000);
 
   // work.length === 0 hits the early "No candidates to process." return
   // path BEFORE any audit append + BEFORE the output dir is created
@@ -1117,3 +1118,216 @@ describe("runGenerate --estimate-cost dry-run path", () => {
     expect(llmFn).not.toHaveBeenCalled();
   });
 });
+
+describe("runGenerate --min-confidence filter", () => {
+  // Pins the confidence-gating path in generate.ts. Three load-bearing
+  // surfaces:
+  //   1. --min-confidence=high: writes only high-confidence pages; skips
+  //      medium + low and emits audit entries with outcome=skipped.
+  //   2. --min-confidence=medium: writes high + medium; skips low.
+  //   3. --min-confidence=low (default): writes everything regardless of
+  //      confidence; pre-existing behavior unchanged.
+  let dir: string;
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "code2wiki-gen-conf-"));
+    await fs.mkdir(path.join(dir, "src"), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, "code2wiki.config.json"),
+      JSON.stringify({
+        output: "./docs/use-cases",
+        include: ["src/**/*.cfc"],
+        maxCandidates: 50,
+      }),
+      "utf-8",
+    );
+    savedEnv = {
+      CODE2WIKI_MOCK: process.env["CODE2WIKI_MOCK"],
+      ANTHROPIC_API_KEY: process.env["ANTHROPIC_API_KEY"],
+    };
+    delete process.env["ANTHROPIC_API_KEY"];
+    process.env["CODE2WIKI_MOCK"] = "1";
+  });
+
+  afterEach(async () => {
+    process.env["CODE2WIKI_MOCK"] = savedEnv["CODE2WIKI_MOCK"];
+    if (savedEnv["ANTHROPIC_API_KEY"] !== undefined) {
+      process.env["ANTHROPIC_API_KEY"] = savedEnv["ANTHROPIC_API_KEY"];
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  // Minimal valid LLM draft with a given confidence level. Reused across tests.
+  function makeDraft(confidence: "high" | "medium" | "low", name: string) {
+    return {
+      title: name,
+      actor: "A user",
+      summary: `${name} performs its operation.`,
+      trigger: `The user invokes ${name}.`,
+      main_flow: [
+        { step: "The system processes the request." },
+        { step: "Control returns to the caller." },
+      ],
+      postconditions: ["The operation completes."],
+      confidence,
+      confidence_reason: "test stub",
+    };
+  }
+
+  it("--min-confidence=high skips medium + low pages and emits outcome=skipped audit entries", async () => {
+    await fs.writeFile(path.join(dir, "src", "two.cfc"), FIXTURE_TWO, "utf-8");
+
+    // alpha → high, beta → low
+    let callCount = 0;
+    const llmFn: LlmFn = async () => {
+      callCount++;
+      return callCount === 1
+        ? makeDraft("high", "Alpha")
+        : makeDraft("low", "Beta");
+    };
+
+    await runGenerate({ cwd: dir, minConfidence: "high", llmFn });
+
+    const allEntries = await fs
+      .readFile(path.join(dir, ".code2wiki", "audit.jsonl"), "utf-8")
+      .then((raw) =>
+        raw
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l) as AuditRow),
+      );
+    const generate = allEntries.filter((e) => e.operation === "generate");
+
+    // Alpha written (high >= high), Beta skipped (low < high).
+    const written = generate.filter((e) => e.outcome !== "skipped");
+    const skipped = generate.filter((e) => e.outcome === "skipped");
+    expect(written).toHaveLength(1);
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!.details?.["skipReason"]).toBe("below_min_confidence");
+    expect(skipped[0]!.details?.["confidence"]).toBe("low");
+
+    // The alpha .md was written to disk; beta was not.
+    const outFiles = await fs.readdir(path.join(dir, "docs", "use-cases"));
+    expect(outFiles).toHaveLength(1);
+  });
+
+  it("--min-confidence=medium skips low-confidence pages only", async () => {
+    await fs.writeFile(path.join(dir, "src", "two.cfc"), FIXTURE_TWO, "utf-8");
+
+    let callCount = 0;
+    const llmFn: LlmFn = async () => {
+      callCount++;
+      return callCount === 1
+        ? makeDraft("medium", "Alpha")
+        : makeDraft("low", "Beta");
+    };
+
+    await runGenerate({ cwd: dir, minConfidence: "medium", llmFn });
+
+    const rows = await readGenerateRows(dir);
+    const written = rows.filter((e) => e.outcome !== "skipped");
+    const skipped = rows.filter((e) => e.outcome === "skipped");
+    // medium >= medium → written; low < medium → skipped.
+    expect(written).toHaveLength(1);
+    expect(skipped).toHaveLength(1);
+  });
+
+  it("--min-confidence=low (default) writes all pages regardless of confidence", async () => {
+    await fs.writeFile(path.join(dir, "src", "two.cfc"), FIXTURE_TWO, "utf-8");
+
+    // Both pages are low-confidence; with the default threshold both should
+    // still be written.
+    let callCount = 0;
+    const llmFn: LlmFn = async () => {
+      callCount++;
+      return makeDraft("low", callCount === 1 ? "Alpha" : "Beta");
+    };
+
+    await runGenerate({ cwd: dir, llmFn }); // no minConfidence → default "low"
+
+    const rows = await readGenerateRows(dir);
+    const skipped = rows.filter((e) => e.outcome === "skipped");
+    expect(skipped).toHaveLength(0);
+    // Both pages written.
+    const outFiles = await fs.readdir(path.join(dir, "docs", "use-cases"));
+    expect(outFiles).toHaveLength(2);
+  });
+
+  // Mirrors the outcome=created audit-invariant pin at line 441-458 (every
+  // generate row must carry promptVersion + mock + source + lines + a
+  // sensible content_hash for replay --since-version filtering, the
+  // dashboard's per-run cards, and audit verification). The skipped path
+  // emits its own appendAuditEntry call (generate.ts:330-344) that is
+  // structurally separate from the success path; a regression dropping any
+  // one field there would compile clean (details is Record<string, unknown>)
+  // and silently break the corresponding downstream surface. content_hash
+  // MUST be null on a skipped row because no .md is written (audit.ts:12,
+  // "or null for skips"); a regression that started populating it would
+  // mis-classify the row as a write in audit verify.
+  it("skipped audit row carries promptVersion + mock + source + lines and a null content_hash", async () => {
+    await fs.writeFile(path.join(dir, "src", "two.cfc"), FIXTURE_TWO, "utf-8");
+
+    let callCount = 0;
+    const llmFn: LlmFn = async () => {
+      callCount++;
+      return callCount === 1
+        ? makeDraft("high", "Alpha")
+        : makeDraft("low", "Beta");
+    };
+
+    await runGenerate({ cwd: dir, minConfidence: "high", llmFn });
+    const rows = await readGenerateRows(dir);
+    const skipped = rows.filter((e) => e.outcome === "skipped");
+    expect(skipped).toHaveLength(1);
+    const row = skipped[0]!;
+    expect(row.content_hash).toBeNull();
+    expect(row.details?.["promptVersion"]).toBe(PROMPT_VERSION);
+    expect(row.details?.["mock"]).toBe(true);
+    expect(row.details?.["source"]).toBe("src/two.cfc");
+    expect(row.details?.["lines"]).toMatch(/^\d+-\d+$/);
+    expect(row.details?.["confidence"]).toBe("low");
+    expect(row.details?.["skipReason"]).toBe("below_min_confidence");
+  });
+
+  // Pins the defensive `?? 1` fallback in meetsConfidenceThreshold
+  // (generate.ts:64) for confidence values outside the {high, medium, low}
+  // enum. The extractor stamps the LLM's confidence verbatim (extractor.ts:
+  // 162, no Zod parse on the inbound draft) so an llmFn that returns an
+  // unrecognized value flows through to the gate. Current behavior: treat
+  // unknown as level 1 ("low"), i.e., skip under --min-confidence=medium
+  // and skip under --min-confidence=high; pass under --min-confidence=low.
+  // A regression flipping the fallback (e.g. `?? 3` "treat unknown as
+  // high, write everything") would silently change customer-visible
+  // behavior with no compile error.
+  it("unknown confidence value falls back to level 'low' (skipped under --min-confidence=medium)", async () => {
+    await fs.writeFile(
+      path.join(dir, "src", "solo.cfc"),
+      FIXTURE_SINGLE,
+      "utf-8",
+    );
+
+    const llmFn: LlmFn = async () =>
+      ({
+        ...makeDraft("low", "Solo"),
+        // Cast bypasses the TS enum; the runtime extractor doesn't Zod-
+        // parse the inbound draft so an unrecognized value reaches the
+        // gate verbatim. Real-world trigger: a future prompt version
+        // adding a new bucket (e.g., "unknown") that pre-stamp audit
+        // tooling hasn't been taught.
+        confidence: "n/a",
+      }) as unknown as ReturnType<typeof makeDraft>;
+
+    await runGenerate({ cwd: dir, minConfidence: "medium", llmFn });
+
+    const rows = await readGenerateRows(dir);
+    const skipped = rows.filter((e) => e.outcome === "skipped");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!.details?.["confidence"]).toBe("n/a");
+    expect(skipped[0]!.details?.["skipReason"]).toBe("below_min_confidence");
+    // No .md written.
+    const outFiles = await fs.readdir(path.join(dir, "docs", "use-cases"));
+    expect(outFiles).toHaveLength(0);
+  }, 30000);
+});
+

@@ -74,6 +74,13 @@ export async function runAudit(opts: AuditOptions): Promise<void> {
   console.log(
     `Showing last ${entries.length} audit entries (newest at bottom):\n`,
   );
+  // Per-render column width: floor at 9 (preserves the historical alignment
+  // for the common short-op case) and grow to the widest op actually on
+  // screen. Hard-coding a magic number went stale every time the
+  // AuditOperation union grew (e.g. `regenerate-skip` at 15,
+  // `calibration_recomputed` at 22), silently misaligning the table the
+  // operator reads after every run.
+  const opPad = Math.max(9, ...entries.map((e) => e.operation.length));
   for (const e of entries) {
     const target = e.details && typeof e.details["target"] === "string"
       ? ` -> ${e.details["target"]}`
@@ -84,7 +91,7 @@ export async function runAudit(opts: AuditOptions): Promise<void> {
     const time = e.timestamp.replace("T", " ").slice(0, 19);
     const sym = symbolFor(e.outcome);
     console.log(
-      `  ${time}  ${e.commit.slice(0, 7)}  ${sym} ${e.operation.padEnd(9)} ${e.page}${target}${url}`,
+      `  ${time}  ${e.commit.slice(0, 7)}  ${sym} ${e.operation.padEnd(opPad)} ${e.page}${target}${url}`,
     );
   }
 }
@@ -101,6 +108,17 @@ function symbolFor(outcome: string): string {
       return "○";
     case "error":
       return "✗";
+    // Outcomes specific to the `retried` op (src/core/audit.ts:60-61).
+    // `recovered` = chain-of-correction retry produced fewer errors than
+    // the first draft; `no_help` = retry did not reduce errors and we
+    // kept the first draft. Both are healthy log states.
+    case "recovered":
+      return "↻";
+    case "no_help":
+      return "⊘";
+    // ADR-034 (Self-learning v2): calibration_recomputed outcome.
+    case "fitted":
+      return "⊕";
     default:
       return "?";
   }

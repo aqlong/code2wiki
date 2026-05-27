@@ -23,6 +23,30 @@ import type { Candidate, CandidateHints } from "../types.js";
  * ADR-037.
  */
 
+// Python control-flow keywords and common built-ins excluded from callee extraction.
+const PYTHON_KEYWORDS = new Set([
+  "if", "elif", "else", "for", "while", "with", "try", "except", "finally",
+  "raise", "return", "yield", "import", "from", "class", "def", "lambda",
+  "pass", "break", "continue", "not", "and", "or", "in", "is", "print",
+  "isinstance", "issubclass", "type", "len", "range", "enumerate", "zip",
+  "map", "filter", "sorted", "reversed", "list", "dict", "set", "tuple",
+  "str", "int", "float", "bool", "bytes", "object", "super", "vars", "dir",
+  "hasattr", "getattr", "setattr", "delattr", "next", "iter", "open",
+  "repr", "format", "abs", "min", "max", "sum", "any", "all", "input",
+  "property", "staticmethod", "classmethod",
+]);
+
+// Django / DRF decorators that control view access. Surfaced as hints.notes
+// so the LLM can describe auth requirements without reading the function body.
+const DJANGO_AUTH_DECORATORS = new Set([
+  "login_required",
+  "permission_required",
+  "staff_member_required",
+  "user_passes_test",
+  "permission_classes",    // DRF @permission_classes([...]) on FBVs
+  "authentication_classes",
+]);
+
 // DRF ViewSet canonical action methods mapped to HTTP verb and path suffix.
 const DRF_ACTIONS: Record<string, { method: string; pathSuffix: string }> = {
   list:           { method: "GET",    pathSuffix: "" },
@@ -71,6 +95,8 @@ export function parseDjango(
   let inViewClass = false;
   let classIndent = 0;
   let className = "";
+  let classPermissions: string[] = [];
+  let classModels: string[] = [];
 
   let i = 0;
   while (i < lines.length) {
@@ -85,6 +111,8 @@ export function parseDjango(
     // Exit view class when indentation returns to (or before) the class's level.
     if (inViewClass && indent <= classIndent) {
       inViewClass = false;
+      classPermissions = [];
+      classModels = [];
       // Fall through: process this line as module-level.
     }
 
@@ -101,6 +129,8 @@ export function parseDjango(
             inViewClass = true;
             classIndent = 0;
             className = name;
+            classPermissions = [];
+            classModels = [];
           }
           i = sigEndIdx + 1;
           continue;
@@ -118,6 +148,7 @@ export function parseDjango(
           const { endIdx } = extractPythonBody(lines, i, sigEndIdx);
 
           if (!name.startsWith("_") && isFbv(params)) {
+            const authNotes = extractDecoratorNotes(lines, decoratorStart, i);
             candidates.push({
               language: "python",
               filePath,
@@ -127,7 +158,7 @@ export function parseDjango(
               lineStart: decoratorStart + 1, // 1-indexed; includes leading decorators
               lineEnd: endIdx + 1,
               source: lines.slice(decoratorStart, endIdx + 1).join("\n"),
-              hints: buildFbvHints(params),
+              hints: buildFbvHints(params, authNotes, lines.slice(decoratorStart, endIdx + 1).join("\n")),
             });
           }
           i = endIdx + 1;
@@ -138,6 +169,49 @@ export function parseDjango(
 
     // ---- Inside view class --------------------------------------------
     if (inViewClass && indent > classIndent) {
+      // Collect `permission_classes = [ClassA, ClassB]` at the class body level.
+      // This is a class attribute in DRF that applies to every method.
+      // Handles both single-line and multi-line list forms: real DRF code
+      // routinely formats permission lists across several lines, e.g.
+      //     permission_classes = [
+      //         IsAuthenticated,
+      //         IsAdminUser,
+      //     ]
+      // so we accumulate lines until the closing `]` is found.
+      const pcStart = trimmed.match(/^permission_classes\s*=\s*\[(.*)$/);
+      if (pcStart) {
+        let inner = pcStart[1] ?? "";
+        let j = i;
+        while (!inner.includes("]") && j + 1 < lines.length) {
+          j++;
+          inner += " " + lines[j].trim();
+        }
+        const closeIdx = inner.indexOf("]");
+        if (closeIdx >= 0) inner = inner.substring(0, closeIdx);
+        classPermissions = inner
+          .split(",")
+          .map((s) => s.trim().split(".").pop()!.replace(/[()[\]]/g, ""))
+          .filter(Boolean);
+        i = j + 1;
+        continue;
+      }
+
+      // Extract `queryset = ModelName.objects.method()` and `model = ModelName`
+      // class attributes so the LLM knows which model this view operates on
+      // even before reading the method body.
+      const qsMatch = trimmed.match(/^queryset\s*=\s*([A-Z][A-Za-z0-9_]*)\.objects\./);
+      if (qsMatch?.[1] && !classModels.includes(qsMatch[1])) {
+        classModels.push(qsMatch[1]);
+        i++;
+        continue;
+      }
+      const modelAttrMatch = trimmed.match(/^model\s*=\s*([A-Z][A-Za-z0-9_]*)\s*$/);
+      if (modelAttrMatch?.[1] && !classModels.includes(modelAttrMatch[1])) {
+        classModels.push(modelAttrMatch[1]);
+        i++;
+        continue;
+      }
+
       if (/^def\s+/.test(trimmed)) {
         const { signature, endIdx: sigEndIdx } = collectParenedHeader(lines, i);
         const defMatch = signature.match(/^def\s+([A-Za-z_]\w*)\s*\(([^)]*)\)/);
@@ -151,6 +225,7 @@ export function parseDjango(
           const drfAction = DRF_ACTIONS[name];
 
           if (!name.startsWith("_") && (httpVerb !== undefined || drfAction !== undefined)) {
+            const authNotes = extractDecoratorNotes(lines, decoratorStart, i);
             candidates.push({
               language: "python",
               filePath,
@@ -160,7 +235,7 @@ export function parseDjango(
               lineStart: decoratorStart + 1, // 1-indexed; includes leading decorators
               lineEnd: endIdx + 1,
               source: lines.slice(decoratorStart, endIdx + 1).join("\n"),
-              hints: buildCbvHints(name, params, className, httpVerb, drfAction),
+              hints: buildCbvHints(name, params, className, httpVerb, drfAction, authNotes, classPermissions, classModels, lines.slice(decoratorStart, endIdx + 1).join("\n")),
             });
           }
           i = endIdx + 1;
@@ -183,9 +258,13 @@ export function parseDjango(
  * are not picked up.
  */
 function isDjangoViewFile(filePath: string): boolean {
-  const basename = path.basename(filePath);
+  // Lowercase both basename and full path so the gate matches the dispatcher's
+  // case-insensitive extension match in parsers/index.ts (e.g., Views.PY routed
+  // by the dispatcher used to drop here on strict-case checks).
+  const lowered = filePath.toLowerCase();
+  const basename = path.basename(lowered);
   if (basename === "views.py" || basename.endsWith("_views.py")) return true;
-  return /[/\\]views[/\\].+\.py$/.test(filePath);
+  return /[/\\]views[/\\].+\.py$/.test(lowered);
 }
 
 /**
@@ -364,10 +443,221 @@ function getIndent(line: string): number {
   return count;
 }
 
-function buildFbvHints(params: string): CandidateHints {
+/**
+ * Scan lines[fromIdx..toIdx) for auth-relevant decorators and return a notes
+ * array, e.g. `["auth: login_required"]` or `["auth: permission_required('app.perm')"]`.
+ * Multi-line decorator args are not fully reconstructed; only single-line forms
+ * produce a parenthesised note.
+ */
+function extractDecoratorNotes(
+  lines: string[],
+  fromIdx: number,
+  toIdx: number,
+): string[] {
+  const notes: string[] = [];
+  for (let j = fromIdx; j < toIdx; j++) {
+    const trimmed = lines[j].trim();
+    if (!trimmed.startsWith("@")) continue;
+    const nameMatch = trimmed.match(/^@(\w+)/);
+    if (!nameMatch) continue;
+    const name = nameMatch[1]!;
+    if (!DJANGO_AUTH_DECORATORS.has(name)) continue;
+    const argMatch = trimmed.match(/^@\w+\(([^)]*)\)/);
+    if (argMatch) {
+      notes.push(`auth: ${name}(${argMatch[1].trim()})`);
+    } else {
+      notes.push(`auth: ${name}`);
+    }
+  }
+  return notes;
+}
+
+/**
+ * Extract Django ORM model names from a view body by scanning for the
+ * `ModelName.objects.` QuerySet accessor pattern. This is canonical Django
+ * and unmistakable: only model classes use `.objects.`. Results are
+ * de-duplicated and surfaced as `databaseTables` so the LLM understands
+ * which models the view reads or writes without scanning the full body.
+ *
+ * Examples matched:
+ *   Order.objects.filter(status="open")   -> "Order"
+ *   User.objects.create(email=email)      -> "User"
+ *   get_object_or_404(Post, pk=pk)        -> (not matched -- no .objects.)
+ */
+function extractOrmModels(source: string): string[] {
+  const seen = new Set<string>();
+  const re = /\b([A-Z][A-Za-z0-9_]*)\.objects\./g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    seen.add(m[1]!);
+  }
+  return [...seen];
+}
+
+function extractCallees(source: string): string[] {
+  // Skip `def` / `async def` signature lines so the function's own name is
+  // not recorded as a callee (e.g. `def create_order(request):` would
+  // otherwise produce `create_order` as a spurious entry).
+  const body = source
+    .split("\n")
+    .filter((line) => !/^\s*(async\s+)?def\s/.test(line))
+    .join("\n");
+  const seen = new Set<string>();
+  const callRe = /\b([a-zA-Z_][\w]*)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = callRe.exec(body)) !== null) {
+    const name = m[1] ?? "";
+    if (name.length < 3) continue;
+    if (PYTHON_KEYWORDS.has(name)) continue;
+    seen.add(name);
+  }
+  return [...seen].slice(0, 30);
+}
+
+/**
+ * Detect high-blast-radius side effects in the view source and return them as
+ * plain-English notes. Email and outbound HTTP are highlighted because they
+ * affect external systems and cannot be undone after the fact.
+ */
+function extractSideEffectNotes(source: string): string[] {
+  const notes: string[] = [];
+  // Django email APIs: send_mail, send_mass_mail, mail_admins, mail_managers,
+  // EmailMessage, EmailMultiAlternatives (all imported from django.core.mail).
+  if (/\b(send_mail|send_mass_mail|mail_admins|mail_managers|EmailMessage|EmailMultiAlternatives)\s*\(/.test(source)) {
+    notes.push("Sends email (Django mail)");
+  }
+  // Common HTTP client libraries used in Django projects.
+  if (/\brequests\.(get|post|put|patch|delete|head|options|request)\s*\(/.test(source)
+    || /\bhttpx\.(get|post|put|patch|delete|head|options|request)\s*\(/.test(source)
+    || /\burllib\.request\.urlopen\s*\(/.test(source)) {
+    notes.push("Makes outbound HTTP request");
+  }
+  // Background job dispatch via Celery -- the dominant async task library in
+  // Django projects. Two canonical dispatch forms:
+  //   - task.delay(arg1, arg2)                   (shorthand, most common)
+  //   - task.apply_async(args=[...], countdown=N) (full API, with routing)
+  // Both enqueue the task on the configured broker (Redis / RabbitMQ) and
+  // return immediately; the real work happens out of band in a worker process.
+  // Audit-critical: the documented view is the trigger, not the executor, and
+  // downstream side effects (email, DB writes, file creation) happen later.
+  // Mirrors C# Hangfire (BackgroundJob.Enqueue) and Ruby ActiveJob
+  // (perform_later / perform_async) background-job notes.
+  // False-positive risk is low: `.delay(` and `.apply_async(` are Celery idioms
+  // with no common alternative meaning in Django view code.
+  if (/\.delay\s*\(/.test(source) || /\.apply_async\s*\(/.test(source)) {
+    notes.push("Enqueues background job");
+  }
+  // Message broker publishing. Four common Python/Django broker libraries:
+  //   - Pika (RabbitMQ Python client): `channel.basic_publish(exchange=..., ...)`
+  //     is the one canonical publish call; it is always audit-critical.
+  //   - Kombu (AMQP abstraction used by Celery): `producer.publish(message, ...)`
+  //     is the direct publish API (distinct from Celery task dispatch which is
+  //     captured under "Enqueues background job" above).
+  //   - kafka-python: `KafkaProducer(...)` is the class instantiation; presence
+  //     in a view body means a message is about to be produced.
+  //   - confluent-kafka: `producer.produce(...)` is the low-level produce call.
+  // Mirrors Java JMS/AMQP/Kafka and C# MassTransit/Azure Service Bus notes.
+  if (
+    /\bchannel\.basic_publish\s*\(/.test(source)
+    || /\bproducer\.publish\s*\(/.test(source)
+    || /\bKafkaProducer\s*\(/.test(source)
+    || /\bproducer\.produce\s*\(/.test(source)
+  ) {
+    notes.push("Sends message to broker (Kombu / Pika)");
+  }
+  // Stored procedure calls via Python DB-API 2.0. `cursor.callproc(name,
+  // args)` is the canonical stored-proc API in every Django project that
+  // drops to raw SQL: `with connection.cursor() as c: c.callproc(...)`.
+  // The method name is proc-specific (no callproc for plain SQL), so it
+  // is always audit-critical: the proc may have triggers, cross-table
+  // writes, and logic invisible in the calling view. Mirrors C#
+  // CommandType.StoredProcedure, Java prepareCall / createStoredProcedureQuery
+  // / SimpleJdbcCall, and CFML <cfstoredproc> detection.
+  if (/\.callproc\s*\(/.test(source)) {
+    notes.push("Calls stored procedure");
+  }
+  // External process execution. Python has two canonical idioms for
+  // spawning a child process; both run with the server's privileges and
+  // are audit-critical (common in PDF rendering, image conversion, legacy
+  // CLI tool integration). Read-only helpers (subprocess.list2cmdline)
+  // are intentionally NOT flagged.
+  //   - subprocess module: run, Popen, call, check_call, check_output,
+  //     getoutput, getstatusoutput
+  //   - os module: system, popen, exec* family (execl/execv/execlp/...),
+  //     spawn* family (spawnl/spawnv/spawnlp/...)
+  // Mirrors Java's Runtime.exec / ProcessBuilder, C#'s Process.Start, and
+  // Ruby's system / backtick / Open3 process-execution notes.
+  if (
+    /\bsubprocess\.(?:run|Popen|call|check_call|check_output|getoutput|getstatusoutput)\s*\(/.test(source)
+    || /\bos\.(?:system|popen|exec[a-z]*|spawn[a-z]*)\s*\(/.test(source)
+  ) {
+    notes.push("Executes external process");
+  }
+  // Cache mutation. Django apps share state via django.core.cache. The
+  // singular `cache` (default cache) and `caches['name']` (named cache)
+  // forms both expose the same mutation API. Read-only operations
+  // (cache.get, cache.get_many, cache.has_key, cache.get_or_set) are
+  // intentionally NOT flagged: no blast radius beyond a possible cache
+  // miss. .clear() is extremely high-blast-radius (wipes the entire
+  // cache) and .delete_pattern() is pattern-based (high blast radius);
+  // both produce the note like every other mutation.
+  // Mirrors Java @CacheEvict/@CachePut, C# IMemoryCache mutations, and
+  // Rails.cache.write/.delete signal.
+  const cacheMutationMethods = "(?:set|set_many|add|delete|delete_many|delete_pattern|clear|incr|decr|touch)";
+  if (
+    new RegExp(`\\bcache\\.${cacheMutationMethods}\\s*\\(`).test(source)
+    || new RegExp(`\\bcaches\\[[^\\]]+\\]\\.${cacheMutationMethods}\\s*\\(`).test(source)
+  ) {
+    notes.push("Mutates application cache");
+  }
+  // Database transactions. Django uses two equivalent forms, both covered
+  // by a single \btransaction\.atomic\b pattern:
+  //   - Context manager: `with transaction.atomic(): ...`
+  //   - Decorator:       `@transaction.atomic` (with or without parens)
+  // Matches CFML <cftransaction>, Java @Transactional, C# TransactionScope,
+  // and Rails Model.transaction side-effect notes.
+  if (/\btransaction\.atomic\b/.test(source)) {
+    notes.push("Executes within a database transaction");
+  }
+  // Filesystem mutations. Writing, deleting, moving, or creating files
+  // affects shared disk state and is audit-relevant. Reads (open(path) without
+  // mode arg, open(path, "r"), Path.read_text, os.stat, os.listdir) are
+  // intentionally NOT flagged: no blast radius. Detects five families:
+  //   - Built-in open() with write/append/exclusive mode (w / a / x / w+ / a+
+  //     / wb / ab, optionally with + or b suffix)
+  //   - os module mutators: remove, unlink, rename, rmdir, makedirs, mkdir,
+  //     replace, symlink, link, chmod, chown
+  //   - shutil mutators: copy, copyfile, copytree, copy2, copymode, move, rmtree
+  //   - pathlib write methods: .write_text(, .write_bytes(
+  //   - Django storage backend: default_storage.save / .delete
+  if (
+    /\bopen\s*\([^,)]+,\s*["'][wax][b+]*["']/.test(source)
+    || /\bos\.(?:remove|unlink|rename|rmdir|makedirs|mkdir|replace|symlink|link|chmod|chown)\s*\(/.test(source)
+    || /\bshutil\.(?:copy|copyfile|copytree|copy2|copymode|move|rmtree)\s*\(/.test(source)
+    || /\.write_text\s*\(/.test(source)
+    || /\.write_bytes\s*\(/.test(source)
+    || /\bdefault_storage\.(?:save|delete)\s*\(/.test(source)
+  ) {
+    notes.push("Writes to file system");
+  }
+  return notes;
+}
+
+function buildFbvHints(
+  params: string,
+  authNotes: string[] = [],
+  source = "",
+): CandidateHints {
   const hints: CandidateHints = {};
   const parsed = parseParams(params);
   if (parsed.length > 0) hints.parameters = parsed;
+  const sideEffects = extractSideEffectNotes(source);
+  const allNotes = [...authNotes, ...sideEffects];
+  if (allNotes.length > 0) hints.notes = allNotes;
+  const models = extractOrmModels(source);
+  if (models.length > 0) hints.databaseTables = models;
+  const callees = extractCallees(source);
+  if (callees.length > 0) hints.callees = callees;
   return hints;
 }
 
@@ -377,6 +667,10 @@ function buildCbvHints(
   className: string,
   httpVerb: string | undefined,
   drfAction: { method: string; pathSuffix: string } | undefined,
+  authNotes: string[] = [],
+  classPermissions: string[] = [],
+  classModels: string[] = [],
+  source = "",
 ): CandidateHints {
   const hints: CandidateHints = {};
 
@@ -394,6 +688,23 @@ function buildCbvHints(
     (p) => p.name !== "self" && p.name !== "request",
   );
   if (parsed.length > 0) hints.parameters = parsed;
+
+  // Merge method-level decorator notes, class-level permission_classes, and
+  // side-effect notes (email, HTTP) all into hints.notes.
+  const allNotes = [...authNotes];
+  if (classPermissions.length > 0) {
+    allNotes.push(`permission_classes: ${classPermissions.join(", ")}`);
+  }
+  allNotes.push(...extractSideEffectNotes(source));
+  if (allNotes.length > 0) hints.notes = allNotes;
+
+  // Merge class-level queryset/model attrs with method-body ORM calls.
+  const methodModels = extractOrmModels(source);
+  const allModels = [...new Set([...classModels, ...methodModels])];
+  if (allModels.length > 0) hints.databaseTables = allModels;
+
+  const callees = extractCallees(source);
+  if (callees.length > 0) hints.callees = callees;
 
   return hints;
 }
@@ -418,7 +729,7 @@ function classToResource(className: string): string {
 }
 
 /**
- * Split a Python parameter list into structured `{ name }` entries.
+ * Split a Python parameter list into structured `{ name, type? }` entries.
  *
  * Splits on commas at bracket depth zero so generic type annotations
  * (`Dict[str, int]`, `Optional[List[Tuple[str, Any]]]`) and dict / list /
@@ -433,20 +744,62 @@ function classToResource(className: string): string {
  * `hints.parameters` as `{ name: "/" }` and `{ name: "" }` (the latter from
  * `*` losing its sole character to the `^[*]+` strip).
  *
+ * When a PEP 3107 annotation is present (`name: Type` or `name: Type = default`),
+ * the type is extracted and returned in the `type` field. The default-value
+ * separator `=` is found depth-aware so generic defaults like
+ * `items: List[str] = []` correctly yield `type = "List[str]"` rather than
+ * truncating at the `]` character.
+ *
  * Examples:
- *   `def my_view(request, *, format="json")`             -> ["request", "format"]
- *   `def my_view(request, pk, /, slug, *, format)`       -> ["request","pk","slug","format"]
- *   `def my_view(*args, **kwargs)`                       -> ["args", "kwargs"]
- *   `def my_view(request, filters: Dict[str, int])`      -> ["request", "filters"]
+ *   `def my_view(request, *, format="json")`             -> [{name:"request"}, {name:"format"}]
+ *   `def my_view(request, pk, /, slug, *, format)`       -> [{name:"request"},{name:"pk"},...]
+ *   `def my_view(*args, **kwargs)`                       -> [{name:"args"}, {name:"kwargs"}]
+ *   `def my_view(request, filters: Dict[str, int])`      -> [{name:"request"}, {name:"filters",type:"Dict[str, int]"}]
+ *   `def my_view(request, pk: int = None)`               -> [{name:"request"}, {name:"pk",type:"int"}]
  */
-function parseParams(params: string): Array<{ name: string }> {
+function parseParams(params: string): Array<{ name: string; type?: string }> {
   return splitParamsTopLevel(params)
     .map((p) => p.trim())
     .filter(Boolean)
     .filter((p) => p !== "*" && p !== "/")
     .map((p) => {
-      const name = p.replace(/^[*]+/, "").split(/\s*[=:]\s*/)[0]?.trim() ?? p;
-      return { name };
+      const stripped = p.replace(/^[*]+/, "");
+
+      // Find the first `:` and first `=` at bracket depth 0 in one pass.
+      // A `:` inside `{"a": 1}` or `Literal["x:y"]` is at depth > 0 and is
+      // NOT a type annotation separator. An `=` before any depth-0 `:` means
+      // this is a plain `name = default` param with no annotation.
+      let depth = 0;
+      let firstColon = -1;
+      let firstEq = -1;
+      for (let i = 0; i < stripped.length; i++) {
+        const ch = stripped[i];
+        if (ch === "(" || ch === "[" || ch === "{") { depth++; continue; }
+        if (ch === ")" || ch === "]" || ch === "}") { depth--; continue; }
+        if (depth !== 0) continue;
+        if (ch === ":" && firstColon < 0) firstColon = i;
+        if (ch === "=" && firstEq < 0) { firstEq = i; break; }
+      }
+
+      const hasAnnotation = firstColon >= 0 && (firstEq < 0 || firstColon < firstEq);
+      if (!hasAnnotation) {
+        const name = (firstEq >= 0 ? stripped.slice(0, firstEq) : stripped).trim();
+        return { name };
+      }
+
+      const name = stripped.slice(0, firstColon).trim();
+      // Extract type from `afterColon`, finding the `=` default separator at depth 0.
+      const afterColon = stripped.slice(firstColon + 1).trim();
+      let d2 = 0;
+      let eqInType = -1;
+      for (let i = 0; i < afterColon.length; i++) {
+        const ch = afterColon[i];
+        if (ch === "(" || ch === "[" || ch === "{") { d2++; continue; }
+        if (ch === ")" || ch === "]" || ch === "}") { d2--; continue; }
+        if (ch === "=" && d2 === 0) { eqInType = i; break; }
+      }
+      const type = (eqInType >= 0 ? afterColon.slice(0, eqInType).trim() : afterColon) || undefined;
+      return { name, type };
     });
 }
 

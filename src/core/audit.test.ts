@@ -195,6 +195,34 @@ describe("audit log", () => {
     const last3 = await tailAuditEntries(dir, 3);
     expect(last3.map((e) => e.page)).toEqual(["p2", "p3", "p4"]);
   });
+
+  it("stamps promptVersion on every `generate` operation (ADR pin)", async () => {
+    const e = await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "abc",
+      page: "p1",
+      outcome: "created",
+      details: { promptVersion: "v15" },
+    });
+    expect(e.details).toBeDefined();
+    expect(e.details?.promptVersion).toBe("v15");
+  });
+
+  it("stamps promptVersion on every `retried` operation (ADR pin)", async () => {
+    const e = await appendAuditEntry(dir, {
+      operation: "retried",
+      commit: "abc",
+      page: "p1",
+      outcome: "recovered",
+      details: {
+        firstIssues: [],
+        retriedIssues: [],
+        promptVersion: "v15",
+      },
+    });
+    expect(e.details).toBeDefined();
+    expect(e.details?.promptVersion).toBe("v15");
+  });
 });
 
 describe("hashContent", () => {
@@ -218,6 +246,76 @@ describe("hashContent", () => {
     const h = hashContent("héllo 🌍");
     expect(h).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(h).not.toBe(hashContent("hello"));
+  });
+});
+
+describe("computeEntryHash (exported pure helper)", () => {
+  // computeEntryHash is the byte-identity contract for any external audit
+  // verifier (per its JSDoc at audit.ts:282). The relative-invariant pins
+  // further down in this file (with sig vs without, with alg vs without,
+  // signing_key_id "" vs absent) defend the canonical JSON path's drop-
+  // undefined + sort-keys semantics, and the appendAuditEntry literal pin
+  // at line 793 defends the writer path. Neither directly pins the helper's
+  // own absolute output format. A refactor that swapped the "sha256:"
+  // prefix for "blake3:" (or dropped it entirely for "efficiency"), or
+  // upper-cased the hex digest, or switched from SHA-256 to SHA-512, would
+  // pass every existing relative pin AND only trip the writer literal test
+  // if the writer call site stayed identical. Pin the helper directly so
+  // the failure mode is unambiguous: "external verifiers will produce
+  // different bytes than they did yesterday" lands on a test name that
+  // names the contract.
+
+  const FIXED_NOW = "2026-05-17T00:00:00.000Z";
+
+  // Same shape the writer constructs at audit.ts:340-353 for the
+  // appendAuditEntry literal-hash fixture on line 793. Reusing the
+  // identical base shape is load-bearing: if the writer's literal and
+  // the helper's literal ever diverge, one of the two paths drifted.
+  const BASE = {
+    timestamp: FIXED_NOW,
+    operation: "generate" as const,
+    commit: "deadbee",
+    page: "demo-page",
+    outcome: "created" as const,
+    details: undefined,
+    content_hash: hashContent("body"),
+    prev_hash: null,
+  };
+
+  it("returns the `sha256:` prefix followed by 64 lowercase hex chars", async () => {
+    const { computeEntryHash } = await import("./audit.js");
+    expect(computeEntryHash(BASE)).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it("produces the byte-identical hash to the writer for the same canonical input (external-verifier contract)", async () => {
+    // The literal here is the SAME value pinned at line 793 against
+    // appendAuditEntry's output. The point is the equivalence: an
+    // external verifier reconstructing this Omit<AuditEntry,"entry_hash">
+    // and calling computeEntryHash gets exactly what the writer wrote.
+    // Drift between helper and writer = silent breakage for every
+    // external auditor reproducing chain hashes from raw audit.jsonl.
+    const { computeEntryHash } = await import("./audit.js");
+    expect(computeEntryHash(BASE)).toBe(
+      "sha256:829f1d72e3f6b736785675a2233621c63f4acc51d3b312f376d0440718b4bd0f",
+    );
+  });
+
+  it("is deterministic for the same input", async () => {
+    const { computeEntryHash } = await import("./audit.js");
+    expect(computeEntryHash(BASE)).toBe(computeEntryHash(BASE));
+  });
+
+  it("changes when a single canonical field changes by one byte", async () => {
+    // Pins that hashed content actually flows into the digest. A regression
+    // that hashed a constant (e.g., returned sha256(canonical_envelope_only)
+    // and forgot to include the entry body) would pass shape + determinism
+    // pins but produce the same hash for every entry. Sensitivity on
+    // `commit` is representative; the per-field flip tests further down
+    // cover the other authenticated fields individually.
+    const { computeEntryHash } = await import("./audit.js");
+    expect(computeEntryHash({ ...BASE, commit: "deadbef" })).not.toBe(
+      computeEntryHash(BASE),
+    );
   });
 });
 
@@ -394,7 +492,7 @@ describe("AuditOperation / AuditOutcome union coverage", () => {
   // Catches a regression that adds a new union member but forgets to update the
   // canonical JSON path or the verifier's parse.
 
-  it("all 7 AuditOperation values roundtrip with a valid chain", async () => {
+  it("all 8 AuditOperation values roundtrip with a valid chain", async () => {
     const ops = [
       "generate",
       "publish",
@@ -403,6 +501,7 @@ describe("AuditOperation / AuditOutcome union coverage", () => {
       "claim",
       "claim_aborted",
       "retried",
+      "calibration_recomputed",
     ] as const;
     for (const op of ops) {
       await appendAuditEntry(dir, {
@@ -419,7 +518,7 @@ describe("AuditOperation / AuditOutcome union coverage", () => {
     expect(result.totalEntries).toBe(ops.length);
   });
 
-  it("all 7 AuditOutcome values roundtrip with a valid chain", async () => {
+  it("all 8 AuditOutcome values roundtrip with a valid chain", async () => {
     const outcomes = [
       "created",
       "updated",
@@ -428,6 +527,7 @@ describe("AuditOperation / AuditOutcome union coverage", () => {
       "error",
       "recovered",
       "no_help",
+      "fitted",
     ] as const;
     for (const oc of outcomes) {
       await appendAuditEntry(dir, {
@@ -590,6 +690,123 @@ describe("verifyAuditChain corruption modes", () => {
     expect(result.ok).toBe(false);
     expect(result.errors.some((e) => e.index === 0 && /entry_hash mismatch/.test(e.reason))).toBe(true);
     expect(result.totalEntries).toBe(2);
+  });
+
+  it("modifying prev_hash of a middle entry breaks chain verification", async () => {
+    // A tamperer modifies an entry's prev_hash field to rewrite history.
+    // Since prev_hash IS part of the authenticated content (included in the
+    // entry_hash computation), modifying it causes the entry's entry_hash
+    // to diverge from what the verifier recomputes. The tampering is
+    // detected as an entry_hash mismatch.
+    const e1 = await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "abc",
+      page: "p1",
+      outcome: "created",
+    });
+    const e2 = await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "abc",
+      page: "p2",
+      outcome: "created",
+    });
+    await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "abc",
+      page: "p3",
+      outcome: "created",
+    });
+    const file = path.join(dir, ".code2wiki", "audit.jsonl");
+    const raw = await fs.readFile(file, "utf-8");
+    // Modify e2's prev_hash to a fake value.
+    const tampered = raw.replace(
+      `"prev_hash":"${e1.entry_hash}"`,
+      `"prev_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000"`,
+    );
+    await fs.writeFile(file, tampered, "utf-8");
+
+    const result = await verifyAuditChain(dir);
+    expect(result.ok).toBe(false);
+    // e1 is fine, but e2's entry_hash no longer recomputes correctly
+    // (because prev_hash is part of the content that gets hashed).
+    expect(result.errors.some((e) => e.index === 1 && /entry_hash mismatch/.test(e.reason))).toBe(true);
+  });
+
+  it("removing a middle entry from the chain breaks verification of the tail", async () => {
+    // A tamperer deletes an entry from the middle, hoping the adjacent
+    // entries will chain around it. But the third entry's prev_hash still
+    // points to the second entry's hash, and with the second deleted, the
+    // third's prev_hash no longer matches the FIRST entry. Chain breaks.
+    await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "abc",
+      page: "p1",
+      outcome: "created",
+    });
+    await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "abc",
+      page: "p2",
+      outcome: "created",
+    });
+    await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "abc",
+      page: "p3",
+      outcome: "created",
+    });
+    const file = path.join(dir, ".code2wiki", "audit.jsonl");
+    const raw = await fs.readFile(file, "utf-8");
+    const lines = raw.split("\n").filter(Boolean);
+    // Remove the middle entry (p2) and splice p1 + p3 back.
+    const spliced = [lines[0], lines[2]].join("\n") + "\n";
+    await fs.writeFile(file, spliced, "utf-8");
+
+    const result = await verifyAuditChain(dir);
+    expect(result.ok).toBe(false);
+    // Both entries have valid entry_hash, but the chain is broken:
+    // p3's prev_hash doesn't match p1's entry_hash.
+    expect(result.totalEntries).toBe(2);
+    expect(result.validEntries).toBe(2);
+    expect(result.errors.some((e) => e.index === 1 && /chain break/.test(e.reason))).toBe(true);
+  });
+
+  it("reordering two middle entries breaks the chain", async () => {
+    // A tamperer swaps two adjacent entries, hoping the chain "just works"
+    // because each entry's hash is still valid. But prev_hash pointers
+    // break: the third entry now points to the second (which is now
+    // the fourth after the swap), not the third's original pred.
+    await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "abc",
+      page: "p1",
+      outcome: "created",
+    });
+    const e2 = await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "abc",
+      page: "p2",
+      outcome: "created",
+    });
+    const e3 = await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "abc",
+      page: "p3",
+      outcome: "created",
+    });
+    const file = path.join(dir, ".code2wiki", "audit.jsonl");
+    const raw = await fs.readFile(file, "utf-8");
+    const lines = raw.split("\n").filter(Boolean);
+    // Swap p2 and p3 (lines[1] and lines[2]).
+    const swapped = [lines[0], lines[2], lines[1]].join("\n") + "\n";
+    await fs.writeFile(file, swapped, "utf-8");
+
+    const result = await verifyAuditChain(dir);
+    expect(result.ok).toBe(false);
+    // After the swap, p3 (now second) has e3.prev_hash which pointed to e2.
+    // But e2 is now third, so the second entry's prev_hash is invalid.
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors.some((e) => /chain break/.test(e.reason))).toBe(true);
   });
 });
 
@@ -1378,5 +1595,214 @@ describe("Ed25519 signing: appendAuditEntry + verifyAuditChain", () => {
     const r = await verifyAuditChain(dir);
     expect(r.ok).toBe(false);
     expect(r.errors[0]?.reason).toMatch(/unknown signing_key_id/);
+  });
+
+  it("detects tampering to the signature field on a signed entry", async () => {
+    // A signed entry with valid entry_hash, alg, signing_key_id, and
+    // a correct signature is legitimate. If an attacker modifies only
+    // the `signature` field to a different base64 string (leaving
+    // entry_hash and other authenticated content intact), the signature
+    // verification must fail: crypto.verify() of the modified signature
+    // against the entry_hash fails. The tamper is detected.
+    const kp = await generateAuditKeypair(dir);
+    const signing = await loadSigningKey(kp.privateKeyPath);
+    const entry = await appendAuditEntry(dir, {
+      operation: "generate",
+      commit: "c",
+      page: "signed-p",
+      outcome: "created",
+      contentHash: hashContent("body"),
+      signing,
+    });
+
+    const file = path.join(dir, ".code2wiki", "audit.jsonl");
+    const raw = await fs.readFile(file, "utf-8");
+    // Replace the signature with a different valid base64 string
+    // (use a 64-byte null buffer to ensure valid base64 format).
+    const fakeSignature = Buffer.alloc(64).toString("base64");
+    const tampered = raw.replace(
+      `"signature":"${entry.signature}"`,
+      `"signature":"${fakeSignature}"`,
+    );
+    expect(tampered).not.toBe(raw);
+    await fs.writeFile(file, tampered, "utf-8");
+
+    const r = await verifyAuditChain(dir);
+    expect(r.ok).toBe(false);
+    expect(r.totalEntries).toBe(1);
+    expect(r.validEntries).toBe(1); // entry_hash recomputes correctly
+    expect(r.signedEntries).toBe(0); // but signature fails
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]?.reason).toMatch(/signature verification failed/);
+  });
+});
+
+describe("canonicalJson (pure helper backing computeEntryHash)", () => {
+  // canonicalJson at src/core/audit.ts:248 is the byte-identity helper for
+  // every audit-entry hash. The chain check downstream relies on it to
+  // reproduce the same string from the same logical fields no matter the
+  // key-insertion order in the source object. Pre-pin coverage was
+  // indirect (through computeEntryHash + the round-trip integration
+  // tests); the contract details below regress easily under "tidy-up"
+  // refactors (drop a sort, swap a filter), so each invariant gets a
+  // targeted assertion that names the failure mode in plain English.
+
+  it("string primitives pass through JSON.stringify (quotes, escaping)", async () => {
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson("foo")).toBe('"foo"');
+    // Embedded double-quote + backslash must escape correctly so the
+    // canonicalised string remains valid JSON for downstream parse.
+    expect(canonicalJson('a"b\\c')).toBe('"a\\"b\\\\c"');
+  });
+
+  it("number / boolean / null primitives pass through JSON.stringify", async () => {
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson(42)).toBe("42");
+    expect(canonicalJson(0)).toBe("0");
+    expect(canonicalJson(-1.5)).toBe("-1.5");
+    expect(canonicalJson(true)).toBe("true");
+    expect(canonicalJson(false)).toBe("false");
+    expect(canonicalJson(null)).toBe("null");
+  });
+
+  it("undefined at the top level returns \"null\" (safety branch)", async () => {
+    // The early-return at audit.ts:249 is the documented "unreachable in
+    // normal usage" safety; pinning it guards against a refactor that
+    // collapses the null/object branch and routes undefined into
+    // JSON.stringify(undefined) (returns undefined, not a string, which
+    // would break every downstream concat).
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson(undefined)).toBe("null");
+  });
+
+  it("empty object renders as \"{}\"; empty array renders as \"[]\"", async () => {
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson({})).toBe("{}");
+    expect(canonicalJson([])).toBe("[]");
+  });
+
+  it("multi-key object: keys sorted alphabetically (defends the .sort() removal)", async () => {
+    // Without .sort() the output would depend on Object.keys iteration
+    // order (insertion order in V8), so two semantically equal objects
+    // built in different orders would hash differently and break the
+    // chain. Build with reverse-alphabetical insertion to make any
+    // insertion-order regression visible.
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson({ c: 3, b: 2, a: 1 })).toBe('{"a":1,"b":2,"c":3}');
+  });
+
+  it("nested object: keys sorted recursively (defends sort-only-at-top-level)", async () => {
+    // A "sort only the outer keys" optimisation would leave the inner
+    // object's keys in insertion order and break the chain for any
+    // entry whose details payload nests an object built in a different
+    // order across runs. The exact-equality assertion catches the
+    // recursive descent.
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson({ b: { y: 2, x: 1 }, a: 0 })).toBe(
+      '{"a":0,"b":{"x":1,"y":2}}',
+    );
+  });
+
+  it("array preserves insertion order (NOT sorted)", async () => {
+    // Arrays are semantically ordered; canonicalJson MUST leave them
+    // alone. Defends a well-meaning "sort everything" refactor that
+    // would corrupt audit details where order matters (e.g., a list of
+    // first-draft validator errors emitted in retry order).
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson([3, 1, 2])).toBe("[3,1,2]");
+    expect(canonicalJson(["c", "a", "b"])).toBe('["c","a","b"]');
+  });
+
+  it("undefined-valued keys are dropped (matches JSON.stringify behaviour)", async () => {
+    // Mirrors JSON.stringify so callers can pass partial objects without
+    // worrying about explicit-undefined leaking into the hash. The
+    // implementation filters with `obj[k] !== undefined`; mutation to a
+    // truthy filter would also drop null / "" / 0 / false (see the four
+    // tests below pinning those distinctly).
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson({ a: 1, b: undefined, c: 3 })).toBe('{"a":1,"c":3}');
+    expect(canonicalJson({ k: undefined })).toBe("{}");
+  });
+
+  it("null-valued keys are RETAINED (distinct from undefined-drop)", async () => {
+    // Load-bearing: an explicit null in audit details carries meaning
+    // (e.g., parent_hash=null on the genesis entry) and MUST survive the
+    // canonicalisation. A truthy-filter regression would drop nulls and
+    // re-hash to a different value on every cold-start.
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson({ a: 1, b: null })).toBe('{"a":1,"b":null}');
+  });
+
+  it("empty-string-valued keys are RETAINED (distinct from undefined-drop)", async () => {
+    // promptVersion="" would silently disappear under a truthy filter
+    // (or `obj[k] != null`), conflating "operator set the flag to empty"
+    // with "operator never set the flag". Pins the strict !== undefined
+    // discriminator.
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson({ k: "" })).toBe('{"k":""}');
+  });
+
+  it("zero-valued keys are RETAINED (distinct from undefined-drop)", async () => {
+    // nObservations=0 in a skipped calibration audit entry must survive.
+    // A truthy filter would drop it and the audit-show display would
+    // render a missing field instead of "0 observations".
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson({ k: 0 })).toBe('{"k":0}');
+  });
+
+  it("false-valued keys are RETAINED (distinct from undefined-drop)", async () => {
+    // dryRun=false in a wet recompute run must survive. A truthy filter
+    // would drop the discriminator and the audit would be ambiguous as
+    // to which branch ran.
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson({ k: false })).toBe('{"k":false}');
+  });
+
+  it("undefined INSIDE an array renders as \"null\" (mirrors JSON.stringify)", async () => {
+    // Arrays are positional; dropping an undefined element would shift
+    // every subsequent index. JSON.stringify and canonicalJson both
+    // preserve length by emitting "null" for undefined slots.
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson([1, undefined, 3])).toBe("[1,null,3]");
+  });
+
+  it("emits no whitespace between tokens", async () => {
+    // Whitespace would change the byte-string and therefore the hash.
+    // Defends a debug-readability refactor that adds JSON.stringify's
+    // space argument.
+    const { canonicalJson } = await import("./audit.js");
+    const out = canonicalJson({ a: 1, b: [1, 2], c: { d: 3 } });
+    expect(out).toBe('{"a":1,"b":[1,2],"c":{"d":3}}');
+    expect(out).not.toMatch(/\s/);
+  });
+
+  it("keys with special characters are JSON.stringify-escaped (not raw concat)", async () => {
+    // The key serialisation path is `JSON.stringify(k) + ":"`; without
+    // it, a key containing a double-quote would break the output's JSON
+    // validity. Pins the escape behaviour for adversarial / unusual keys.
+    const { canonicalJson } = await import("./audit.js");
+    expect(canonicalJson({ 'k"with"quotes': 1 })).toBe(
+      '{"k\\"with\\"quotes":1}',
+    );
+  });
+
+  it("output is parseable JSON that round-trips to a semantically equal value", async () => {
+    // Catches any output that drifts away from strict JSON syntax (e.g.,
+    // trailing commas, unquoted keys, NaN, Infinity). The pin is the
+    // round-trip equivalence: JSON.parse(canonicalJson(x)) must deeply
+    // equal x with undefined-valued keys dropped.
+    const { canonicalJson } = await import("./audit.js");
+    const input = {
+      operation: "generate",
+      page: "foo-bar",
+      details: {
+        promptVersion: "v5",
+        retryOutcome: null,
+        firstDraftErrors: 0,
+        wasSkipped: false,
+      },
+      tags: ["a", "b"],
+    };
+    expect(JSON.parse(canonicalJson(input))).toEqual(input);
   });
 });
