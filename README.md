@@ -39,7 +39,48 @@ node dist/cli/index.js generate --cwd /path/to/your/project
 
 The output lands in `./docs/use-cases/` by default, one Markdown file per use case, ready to paste into Confluence, Notion, or commit to your repo.
 
-## Languages supported (today)
+## LLM backends
+
+Code2Wiki supports two LLM backends. **Mock mode is the default** — no key needed, runs the full pipeline with placeholder text.
+
+### Anthropic (default for real generation)
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+code2wiki generate --cwd /path/to/your/project
+```
+
+### Azure OpenAI
+
+If your team routes external AI traffic through Azure OpenAI, set these env vars and the Anthropic SDK is never contacted:
+
+| Env var | Required | Description |
+|---|---|---|
+| `AZURE_OPENAI_API_KEY` | ✅ | Your Azure OpenAI resource key |
+| `AZURE_OPENAI_ENDPOINT` | ✅ | e.g. `https://my-resource.openai.azure.com` |
+| `AZURE_OPENAI_DEPLOYMENT` | optional | Deployment name (defaults to `config.model`) |
+| `AZURE_OPENAI_API_VERSION` | optional | Defaults to `2024-10-21` |
+| `CODE2WIKI_LLM_BACKEND` | optional | Force `azure-openai` or `anthropic`; omit for auto-detect |
+
+**Auto-detect rules** (in priority order):
+
+1. `config.mock=true` or `CODE2WIKI_MOCK=1` → always mock, no API call.
+2. `CODE2WIKI_LLM_BACKEND` env var → explicit override.
+3. `config.llmBackend` in `code2wiki.config.json` → explicit config.
+4. Both Azure key + endpoint present and `ANTHROPIC_API_KEY` absent → Azure.
+5. `ANTHROPIC_API_KEY` present → Anthropic.
+6. Neither → mock (zero-cost smoke-test path).
+
+```bash
+export AZURE_OPENAI_API_KEY=...
+export AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com
+export AZURE_OPENAI_DEPLOYMENT=gpt-4o
+code2wiki generate --cwd /path/to/your/project
+```
+
+> **Note:** `--estimate-cost` requires `ANTHROPIC_API_KEY` and is not available when the Azure backend is active (Azure OpenAI does not expose a non-billed token-counting endpoint equivalent to Anthropic's `messages.countTokens`).
+
+
 
 | Language | Parser | Status |
 |---|---|---|

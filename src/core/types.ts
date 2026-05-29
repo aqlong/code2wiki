@@ -276,6 +276,24 @@ export const ConfigSchema = z.object({
   model: z.string().default("claude-sonnet-4-6"),
   /** Use mock mode (no API calls). */
   mock: z.boolean().default(false),
+  /**
+   * LLM backend to use for generation.
+   *   - 'anthropic' (default): requires ANTHROPIC_API_KEY.
+   *   - 'azure-openai': requires AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT.
+   *     The deployed model name is taken from AZURE_OPENAI_DEPLOYMENT (falls
+   *     back to config.model). API version defaults to AZURE_OPENAI_API_VERSION
+   *     or '2024-10-21'.
+   *   - 'auto' (default when unset): prefers azure-openai if
+   *     AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT are present and
+   *     ANTHROPIC_API_KEY is absent; otherwise falls back to anthropic; mock
+   *     if neither is present.
+   *
+   * Can also be overridden at runtime with the CODE2WIKI_LLM_BACKEND env var
+   * ('anthropic' | 'azure-openai'). The env var takes precedence over config.
+   */
+  llmBackend: z
+    .enum(["anthropic", "azure-openai", "auto"])
+    .default("auto"),
   /** Maximum number of candidates to process per run (cost guardrail). */
   maxCandidates: z.number().int().positive().default(50),
   /** Include methods whose entire body is `return <literal>;` in the
