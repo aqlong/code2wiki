@@ -725,11 +725,15 @@ describe("extractWithLLM: Azure OpenAI backend", () => {
     expect(anthropicCtor).not.toHaveBeenCalled();
   });
 
-  it("pins max_tokens=4096 for Azure (cost guardrail)", async () => {
+  it("uses max_completion_tokens=16384 for Azure (reasoning model needs headroom for chain-of-thought)", async () => {
     azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
     await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
     expect(azureChatCreate).toHaveBeenCalledWith(
-      expect.objectContaining({ max_tokens: 4096 }),
+      expect.objectContaining({ max_completion_tokens: 16384 }),
+    );
+    // max_tokens must NOT be passed (breaks o-series reasoning models)
+    expect(azureChatCreate).not.toHaveBeenCalledWith(
+      expect.objectContaining({ max_tokens: expect.anything() }),
     );
   });
 

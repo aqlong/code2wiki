@@ -88,7 +88,11 @@ async function extractWithAzure(
 
   const response = await client.chat.completions.create({
     model: deployment,
-    max_tokens: 4096,
+    // Reasoning models (o-series) consume internal chain-of-thought tokens that
+    // count against max_completion_tokens but are not visible in the response.
+    // 4096 is enough for standard models but leaves almost nothing for o-series
+    // models after reasoning. 16384 gives comfortable headroom for both.
+    max_completion_tokens: 16384,
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: userPrompt },
@@ -96,6 +100,16 @@ async function extractWithAzure(
   });
 
   const text = response.choices[0]?.message?.content ?? "";
+  const finishReason = response.choices[0]?.finish_reason;
+  const refusal = (response.choices[0]?.message as { refusal?: string })?.refusal;
+
+  if (!text) {
+    const detail = refusal
+      ? `Model refused: ${refusal}`
+      : `finish_reason=${finishReason ?? "unknown"}. The file may be too large for the model's context window. Try a smaller file or a model with a larger context.`;
+    throw new Error(`Azure OpenAI returned empty content. ${detail}`);
+  }
+
   return parseJsonObject(text);
 }
 
