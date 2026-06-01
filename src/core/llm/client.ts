@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { AzureOpenAI } from "openai";
 import type { Candidate, Config } from "../types.js";
 import { SYSTEM_PROMPT, buildUserPrompt } from "./prompts.js";
 import { mockExtract } from "./mock.js";
@@ -18,34 +19,144 @@ export interface ExtractOptions {
   retryHint?: string;
 }
 
-/**
- * Run the LLM extraction for a single candidate. Returns a parsed JSON
- * object matching the schema in prompts.ts. Falls back to mockExtract
- * when no API key is set or mock mode is forced.
- */
-export async function extractWithLLM(
-  opts: ExtractOptions,
-): Promise<unknown> {
-  const useMock =
-    opts.config.mock ||
-    process.env["CODE2WIKI_MOCK"] === "1" ||
-    !process.env["ANTHROPIC_API_KEY"];
+// ── Backend detection ────────────────────────────────────────────────────────
 
-  if (useMock) {
-    return mockExtract(opts.candidate, opts.projectName);
+export type LLMBackend = "anthropic" | "azure-openai" | "mock";
+
+/**
+ * Resolve which LLM backend to use for this call.
+ *
+ * Priority order (highest first):
+ *   1. Mock: config.mock=true OR CODE2WIKI_MOCK=1 → always mock, no LLM.
+ *   2. CODE2WIKI_LLM_BACKEND env var ('anthropic' | 'azure-openai').
+ *   3. config.llmBackend ('anthropic' | 'azure-openai').
+ *   4. Auto-detect:
+ *      - Azure if AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT are set
+ *        and ANTHROPIC_API_KEY is absent.
+ *      - Anthropic if ANTHROPIC_API_KEY is set.
+ *      - Mock if neither is present (zero-cost smoke-test path).
+ */
+export function resolveBackend(config: Config): LLMBackend {
+  if (config.mock || process.env["CODE2WIKI_MOCK"] === "1") return "mock";
+
+  const envOverride = process.env["CODE2WIKI_LLM_BACKEND"];
+  if (envOverride === "azure-openai") return validateAzureEnv();
+  if (envOverride === "anthropic") return "anthropic";
+
+  const cfgBackend = config.llmBackend ?? "auto";
+  if (cfgBackend === "azure-openai") return validateAzureEnv();
+  if (cfgBackend === "anthropic") return "anthropic";
+
+  // Auto-detect.
+  const hasAzure =
+    !!process.env["AZURE_OPENAI_API_KEY"] &&
+    !!process.env["AZURE_OPENAI_ENDPOINT"];
+  const hasAnthropic = !!process.env["ANTHROPIC_API_KEY"];
+
+  if (hasAzure && !hasAnthropic) return "azure-openai";
+  if (hasAnthropic) return "anthropic";
+  return "mock";
+}
+
+function validateAzureEnv(): "azure-openai" {
+  const missing: string[] = [];
+  if (!process.env["AZURE_OPENAI_API_KEY"]) missing.push("AZURE_OPENAI_API_KEY");
+  if (!process.env["AZURE_OPENAI_ENDPOINT"]) missing.push("AZURE_OPENAI_ENDPOINT");
+  if (missing.length > 0) {
+    throw new Error(
+      `Azure OpenAI backend selected but the following env vars are missing: ${missing.join(", ")}. ` +
+        "Set them and re-run, or remove CODE2WIKI_LLM_BACKEND to let code2wiki auto-detect.",
+    );
+  }
+  return "azure-openai";
+}
+
+// ── Azure OpenAI extraction ──────────────────────────────────────────────────
+
+/**
+ * Default headroom for Azure OpenAI completions. Sized for o-series reasoning
+ * models (o1, o3, gpt-5, gpt-5-mini) which consume invisible chain-of-thought
+ * tokens against this budget. Non-reasoning models (gpt-4o, gpt-4-turbo) use
+ * a fraction of this and pay only for what they emit. Override with
+ * AZURE_OPENAI_MAX_COMPLETION_TOKENS if you have a non-reasoning deployment
+ * and want to tighten the cost cap (e.g. set to 4096 to match the Anthropic
+ * path).
+ */
+const AZURE_DEFAULT_MAX_COMPLETION_TOKENS = 16384;
+
+async function extractWithAzure(
+  userPrompt: string,
+  config: Config,
+): Promise<unknown> {
+  // Defensive re-check: extractWithAzure is only called via extractWithLLM →
+  // resolveBackend → validateAzureEnv, so these are validated. But if a
+  // refactor ever calls this function directly, we surface the same
+  // actionable error instead of a TypeError on the ! assertion.
+  const apiKey = process.env["AZURE_OPENAI_API_KEY"];
+  const endpoint = process.env["AZURE_OPENAI_ENDPOINT"];
+  if (!apiKey || !endpoint) {
+    throw new Error(
+      "extractWithAzure requires AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT. " +
+        "Use extractWithLLM() instead of calling this directly so backend selection is consistent.",
+    );
   }
 
+  const deployment =
+    process.env["AZURE_OPENAI_DEPLOYMENT"] || config.model || "gpt-4o";
+  const apiVersion =
+    process.env["AZURE_OPENAI_API_VERSION"] || "2024-10-21";
+
+  // Configurable completion budget. Reasoning models burn most of it on
+  // invisible CoT; standard models barely touch it. Default sized for the
+  // reasoning case.
+  const maxCompletionTokens = Number(
+    process.env["AZURE_OPENAI_MAX_COMPLETION_TOKENS"] ||
+      AZURE_DEFAULT_MAX_COMPLETION_TOKENS,
+  );
+
+  const client = new AzureOpenAI({ apiKey, endpoint, deployment, apiVersion });
+
+  // Note: Azure OpenAI auto-caches prompt prefixes >= 1024 tokens for
+  // qualifying models (gpt-4o, o1, etc.). The SYSTEM_PROMPT is the stable
+  // prefix here so caching kicks in automatically without an explicit
+  // cache_control field (unlike Anthropic, where it must be opt-in).
+  const response = await client.chat.completions.create({
+    model: deployment,
+    max_completion_tokens: maxCompletionTokens,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userPrompt },
+    ],
+  });
+
+  const text = response.choices[0]?.message?.content ?? "";
+  const finishReason = response.choices[0]?.finish_reason;
+  const refusal = (response.choices[0]?.message as { refusal?: string })?.refusal;
+
+  if (!text) {
+    const detail = refusal
+      ? `Model refused: ${refusal}`
+      : finishReason === "length"
+        ? `finish_reason=length: the model exhausted its max_completion_tokens budget (${maxCompletionTokens}) before emitting any visible output. This usually means the file is too large for the model's context window OR (for o-series reasoning models) the reasoning chain consumed the entire budget. Try a larger AZURE_OPENAI_MAX_COMPLETION_TOKENS, a smaller file, or a non-reasoning deployment.`
+        : `finish_reason=${finishReason ?? "unknown"}.`;
+    throw new Error(`Azure OpenAI returned empty content. ${detail}`);
+  }
+
+  return parseJsonObject(text);
+}
+
+// ── Anthropic extraction ─────────────────────────────────────────────────────
+
+async function extractWithAnthropic(
+  userPrompt: string,
+  config: Config,
+): Promise<unknown> {
   const client = new Anthropic({
     apiKey: process.env["ANTHROPIC_API_KEY"],
   });
 
-  const baseUserPrompt = buildUserPrompt(opts.candidate, opts.projectName);
-  const userPrompt = opts.retryHint
-    ? `${baseUserPrompt}\n\n---\n\n${opts.retryHint}`
-    : baseUserPrompt;
-
   const response = await client.messages.create({
-    model: opts.config.model,
+    model: config.model,
     max_tokens: 4096,
     system: [
       {
@@ -69,12 +180,51 @@ export async function extractWithLLM(
   return parseJsonObject(text);
 }
 
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Run the LLM extraction for a single candidate. Returns a parsed JSON
+ * object matching the schema in prompts.ts. Falls back to mockExtract
+ * when no API key is set or mock mode is forced.
+ *
+ * Backend selection: see resolveBackend(). Short version:
+ *   - Mock by default (no keys needed).
+ *   - Azure OpenAI when AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT are set
+ *     (or CODE2WIKI_LLM_BACKEND=azure-openai / config.llmBackend=azure-openai).
+ *   - Anthropic when ANTHROPIC_API_KEY is set and Azure is not selected.
+ */
+export async function extractWithLLM(
+  opts: ExtractOptions,
+): Promise<unknown> {
+  const backend = resolveBackend(opts.config);
+
+  if (backend === "mock") {
+    return mockExtract(opts.candidate, opts.projectName);
+  }
+
+  const baseUserPrompt = buildUserPrompt(opts.candidate, opts.projectName);
+  const userPrompt = opts.retryHint
+    ? `${baseUserPrompt}\n\n---\n\n${opts.retryHint}`
+    : baseUserPrompt;
+
+  if (backend === "azure-openai") {
+    return extractWithAzure(userPrompt, opts.config);
+  }
+
+  return extractWithAnthropic(userPrompt, opts.config);
+}
+
 /**
  * Per-candidate token-count breakdown for `code2wiki generate
  * --estimate-cost`. Returns system and user input tokens separately
  * because they're priced differently downstream (system has
  * cache_control: ephemeral in extractWithLLM, user does not), so the
  * cost helper applies the 50% cache discount only to systemTokens.
+ *
+ * NOTE: Azure OpenAI does not provide a non-billed token-counting endpoint
+ * equivalent to Anthropic's messages.countTokens. When the Azure backend is
+ * active, --estimate-cost is unsupported and this function throws a clear
+ * error.
  *
  * Cost: the messages.countTokens endpoint is non-billed (Anthropic
  * exposes it for cost-prediction workflows like this one). Two calls
@@ -99,6 +249,15 @@ export type CountTokensFn = (opts: {
 }) => Promise<CountTokensResult>;
 
 export const countTokens: CountTokensFn = async (opts) => {
+  const backend = resolveBackend(opts.config);
+  if (backend === "azure-openai") {
+    throw new Error(
+      "--estimate-cost is not supported with the Azure OpenAI backend. " +
+        "Azure OpenAI does not expose a non-billed token-counting endpoint. " +
+        "Remove AZURE_OPENAI_API_KEY (or set CODE2WIKI_LLM_BACKEND=anthropic) " +
+        "and set ANTHROPIC_API_KEY to use the cost-estimation feature.",
+    );
+  }
   if (!process.env["ANTHROPIC_API_KEY"]) {
     throw new Error(
       "countTokens requires ANTHROPIC_API_KEY (the messages.countTokens endpoint is non-billed but still authenticated).",

@@ -165,10 +165,17 @@ export async function runGenerate(opts: GenerateOptions): Promise<void> {
   const usingMock =
     config.mock ||
     process.env["CODE2WIKI_MOCK"] === "1" ||
-    !process.env["ANTHROPIC_API_KEY"];
+    (!process.env["ANTHROPIC_API_KEY"] &&
+      (!process.env["AZURE_OPENAI_API_KEY"] || !process.env["AZURE_OPENAI_ENDPOINT"]));
+
+  const backendLabel =
+    !usingMock && (process.env["CODE2WIKI_LLM_BACKEND"] === "azure-openai" ||
+      (process.env["AZURE_OPENAI_API_KEY"] && !process.env["ANTHROPIC_API_KEY"]))
+      ? `Azure OpenAI (${process.env["AZURE_OPENAI_DEPLOYMENT"] || config.model})`
+      : config.model;
 
   console.log(
-    `[code2wiki] Generating ${work.length} use case(s)${usingMock ? " (MOCK MODE, no LLM call)" : ` via ${config.model}`}...`,
+    `[code2wiki] Generating ${work.length} use case(s)${usingMock ? " (MOCK MODE, no LLM call)" : ` via ${backendLabel}`}...`,
   );
 
   // First pass: extract all use cases (collecting slugs for the second pass).

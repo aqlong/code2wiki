@@ -21,7 +21,29 @@ vi.mock("@anthropic-ai/sdk", () => ({
   }),
 }));
 
-import { extractWithLLM, countTokens } from "./client.js";
+// Azure OpenAI SDK spies — hoisted so vi.mock can reference them.
+const { azureChatCreate, azureOpenAICtor } = vi.hoisted(() => ({
+  azureChatCreate: vi.fn(),
+  azureOpenAICtor: vi.fn(),
+}));
+
+vi.mock("openai", () => ({
+  AzureOpenAI: vi
+    .fn()
+    .mockImplementation(
+      (opts: {
+        apiKey?: string;
+        endpoint?: string;
+        deployment?: string;
+        apiVersion?: string;
+      }) => {
+        azureOpenAICtor(opts);
+        return { chat: { completions: { create: azureChatCreate } } };
+      },
+    ),
+}));
+
+import { extractWithLLM, countTokens, resolveBackend } from "./client.js";
 import { SYSTEM_PROMPT, buildUserPrompt } from "./prompts.js";
 
 const CANDIDATE: Candidate = {
@@ -45,6 +67,7 @@ const CONFIG: Config = {
   output: "./docs/use-cases",
   model: "claude-sonnet-4-6",
   mock: false,
+  llmBackend: "auto",
   maxCandidates: 50,
   publish: {},
 };
@@ -53,14 +76,29 @@ function textBlocks(...parts: string[]) {
   return { content: parts.map((text) => ({ type: "text" as const, text })) };
 }
 
+/** OpenAI-style chat completion response. */
+function chatResponse(content: string) {
+  return { choices: [{ message: { content } }] };
+}
+
 beforeEach(() => {
   messagesCreate.mockReset();
   messagesCountTokens.mockReset();
   anthropicCtor.mockReset();
-  // Default to "SDK path is reachable"; every test that wants mock mode
-  // overrides exactly one of the three gates.
+  azureChatCreate.mockReset();
+  azureOpenAICtor.mockReset();
+  // Default to "Anthropic SDK path is reachable"; every test that wants mock
+  // mode or Azure mode overrides exactly what it needs.
   vi.stubEnv("ANTHROPIC_API_KEY", "test-key");
   vi.stubEnv("CODE2WIKI_MOCK", "");
+  vi.stubEnv("CODE2WIKI_LLM_BACKEND", "");
+  // Clear Azure env vars so tests that don't set them don't accidentally
+  // trigger the Azure path.
+  vi.stubEnv("AZURE_OPENAI_API_KEY", "");
+  vi.stubEnv("AZURE_OPENAI_ENDPOINT", "");
+  vi.stubEnv("AZURE_OPENAI_DEPLOYMENT", "");
+  vi.stubEnv("AZURE_OPENAI_API_VERSION", "");
+  vi.stubEnv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "");
 });
 
 afterEach(() => {
@@ -395,6 +433,23 @@ describe("extractWithLLM, response parsing", () => {
       expect(msg).not.toContain(bad.slice(0, 201));
     }
   });
+
+  it("throws on prefixed text + fenced JSON (model adds chatty preamble)", async () => {
+    // A regression where someone "improves" parseJsonObject to greedily
+    // extract any { ... } block could silently swallow this and pretend
+    // it worked. Pin the strict-fence-only contract: the regex strips a
+    // leading fence ONLY when it's at the very start (after trim).
+    const prefixed =
+      "Here is the JSON you asked for:\n```json\n" + `{"k":"v"}` + "\n```";
+    messagesCreate.mockResolvedValueOnce(textBlocks(prefixed));
+    await expect(
+      extractWithLLM({
+        candidate: CANDIDATE,
+        projectName: "demo",
+        config: CONFIG,
+      }),
+    ).rejects.toThrow(/LLM did not return valid JSON/);
+  });
 });
 
 describe("countTokens, two-call subtract-for-system math", () => {
@@ -507,3 +562,271 @@ describe("countTokens, two-call subtract-for-system math", () => {
     expect(messagesCreate).not.toHaveBeenCalled();
   });
 });
+
+// ── resolveBackend ────────────────────────────────────────────────────────────
+
+describe("resolveBackend", () => {
+  it("returns 'mock' when config.mock=true, regardless of env vars", () => {
+    expect(resolveBackend({ ...CONFIG, mock: true })).toBe("mock");
+  });
+
+  it("returns 'mock' when CODE2WIKI_MOCK=1", () => {
+    vi.stubEnv("CODE2WIKI_MOCK", "1");
+    expect(resolveBackend(CONFIG)).toBe("mock");
+  });
+
+  it("returns 'anthropic' when ANTHROPIC_API_KEY is set and no Azure override", () => {
+    expect(resolveBackend(CONFIG)).toBe("anthropic");
+  });
+
+  it("returns 'mock' when neither Anthropic nor Azure creds are present", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    expect(resolveBackend(CONFIG)).toBe("mock");
+  });
+
+  it("returns 'azure-openai' when CODE2WIKI_LLM_BACKEND=azure-openai and Azure creds are set", () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "azure-openai");
+    vi.stubEnv("AZURE_OPENAI_API_KEY", "az-key");
+    vi.stubEnv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com");
+    expect(resolveBackend(CONFIG)).toBe("azure-openai");
+  });
+
+  it("throws when CODE2WIKI_LLM_BACKEND=azure-openai but Azure creds are missing", () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "azure-openai");
+    expect(() => resolveBackend(CONFIG)).toThrow(/AZURE_OPENAI_API_KEY/);
+  });
+
+  it("returns 'azure-openai' when config.llmBackend=azure-openai and Azure creds are set", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("AZURE_OPENAI_API_KEY", "az-key");
+    vi.stubEnv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com");
+    expect(resolveBackend({ ...CONFIG, llmBackend: "azure-openai" })).toBe("azure-openai");
+  });
+
+  it("auto-detects azure-openai when Azure creds present and ANTHROPIC_API_KEY is absent", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("AZURE_OPENAI_API_KEY", "az-key");
+    vi.stubEnv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com");
+    expect(resolveBackend(CONFIG)).toBe("azure-openai");
+  });
+
+  it("prefers anthropic over azure-openai in auto mode when both keys are present", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-xxx");
+    vi.stubEnv("AZURE_OPENAI_API_KEY", "az-key");
+    vi.stubEnv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com");
+    expect(resolveBackend(CONFIG)).toBe("anthropic");
+  });
+
+  it("CODE2WIKI_LLM_BACKEND env var overrides config.llmBackend", () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "anthropic");
+    // Even if config says azure-openai, env var wins
+    expect(resolveBackend({ ...CONFIG, llmBackend: "azure-openai" })).toBe("anthropic");
+  });
+});
+
+// ── Azure OpenAI extraction ───────────────────────────────────────────────────
+
+describe("extractWithLLM: Azure OpenAI backend", () => {
+  const AZURE_CONFIG: Config = { ...CONFIG, mock: false, llmBackend: "azure-openai" };
+
+  beforeEach(() => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "azure-openai");
+    vi.stubEnv("AZURE_OPENAI_API_KEY", "az-test-key");
+    vi.stubEnv("AZURE_OPENAI_ENDPOINT", "https://test.openai.azure.com");
+    vi.stubEnv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini");
+    vi.stubEnv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview");
+  });
+
+  it("routes to Azure when CODE2WIKI_LLM_BACKEND=azure-openai", async () => {
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{"ok":true}`));
+    const result = await extractWithLLM({
+      candidate: CANDIDATE,
+      projectName: "demo",
+      config: CONFIG,
+    });
+    expect(result).toEqual({ ok: true });
+    expect(azureOpenAICtor).toHaveBeenCalledTimes(1);
+    expect(anthropicCtor).not.toHaveBeenCalled();
+  });
+
+  it("uses AZURE_OPENAI_DEPLOYMENT as model in the chat completions call", async () => {
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    expect(azureChatCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "gpt-5-mini" }),
+    );
+  });
+
+  it("falls back to config.model when AZURE_OPENAI_DEPLOYMENT is not set", async () => {
+    vi.stubEnv("AZURE_OPENAI_DEPLOYMENT", "");
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({
+      candidate: CANDIDATE,
+      projectName: "demo",
+      config: { ...AZURE_CONFIG, model: "gpt-4o" },
+    });
+    expect(azureChatCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "gpt-4o" }),
+    );
+  });
+
+  it("instantiates AzureOpenAI with apiKey, endpoint, deployment and apiVersion from env", async () => {
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    expect(azureOpenAICtor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: "az-test-key",
+        endpoint: "https://test.openai.azure.com",
+        deployment: "gpt-5-mini",
+        apiVersion: "2025-04-01-preview",
+      }),
+    );
+  });
+
+  it("sends SYSTEM_PROMPT as role='system' message (not Anthropic-style system field)", async () => {
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    const call = azureChatCreate.mock.calls[0]?.[0] as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(call.messages[0]).toEqual({ role: "system", content: SYSTEM_PROMPT });
+  });
+
+  it("sends buildUserPrompt content as role='user' message", async () => {
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    const call = azureChatCreate.mock.calls[0]?.[0] as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(call.messages[1]).toEqual({
+      role: "user",
+      content: buildUserPrompt(CANDIDATE, "demo"),
+    });
+  });
+
+  it("appends retryHint after separator on Azure path (same as Anthropic)", async () => {
+    const hint = "VALIDATOR: title is empty";
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({
+      candidate: CANDIDATE,
+      projectName: "demo",
+      config: AZURE_CONFIG,
+      retryHint: hint,
+    });
+    const call = azureChatCreate.mock.calls[0]?.[0] as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    const base = buildUserPrompt(CANDIDATE, "demo");
+    expect(call.messages[1]?.content).toBe(`${base}\n\n---\n\n${hint}`);
+  });
+
+  it("parses JSON from Azure chat completion response (strips code fence)", async () => {
+    azureChatCreate.mockResolvedValueOnce(chatResponse("```json\n{\"k\":\"v\"}\n```"));
+    const result = await extractWithLLM({
+      candidate: CANDIDATE,
+      projectName: "demo",
+      config: AZURE_CONFIG,
+    });
+    expect(result).toEqual({ k: "v" });
+  });
+
+  it("mock mode overrides Azure when CODE2WIKI_MOCK=1", async () => {
+    vi.stubEnv("CODE2WIKI_MOCK", "1");
+    const result = (await extractWithLLM({
+      candidate: CANDIDATE,
+      projectName: "demo",
+      config: AZURE_CONFIG,
+    })) as Record<string, unknown>;
+    expect(result["tags"]).toContain("mock-output");
+    expect(azureOpenAICtor).not.toHaveBeenCalled();
+    expect(anthropicCtor).not.toHaveBeenCalled();
+  });
+
+  it("uses max_completion_tokens=16384 for Azure (reasoning model needs headroom for chain-of-thought)", async () => {
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    expect(azureChatCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ max_completion_tokens: 16384 }),
+    );
+    // max_tokens must NOT be passed (breaks o-series reasoning models)
+    expect(azureChatCreate).not.toHaveBeenCalledWith(
+      expect.objectContaining({ max_tokens: expect.anything() }),
+    );
+  });
+
+  it("never invokes Anthropic SDK when on Azure path", async () => {
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    expect(anthropicCtor).not.toHaveBeenCalled();
+    expect(messagesCreate).not.toHaveBeenCalled();
+  });
+
+  it("defaults apiVersion to 2024-10-21 when AZURE_OPENAI_API_VERSION is unset", async () => {
+    vi.stubEnv("AZURE_OPENAI_API_VERSION", "");
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    expect(azureOpenAICtor).toHaveBeenCalledWith(
+      expect.objectContaining({ apiVersion: "2024-10-21" }),
+    );
+  });
+
+  it("honors AZURE_OPENAI_MAX_COMPLETION_TOKENS override (cost control for non-reasoning models)", async () => {
+    vi.stubEnv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "4096");
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    expect(azureChatCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ max_completion_tokens: 4096 }),
+    );
+  });
+
+  it("throws a length-cap diagnostic when finish_reason='length' and content is empty (o-series CoT exhausted budget)", async () => {
+    azureChatCreate.mockResolvedValueOnce({
+      choices: [{ message: { content: "" }, finish_reason: "length" }],
+    });
+    await expect(
+      extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG }),
+    ).rejects.toThrow(/finish_reason=length.*AZURE_OPENAI_MAX_COMPLETION_TOKENS/);
+  });
+
+  it("throws a refusal diagnostic when message.refusal is populated (content filter / safety system)", async () => {
+    azureChatCreate.mockResolvedValueOnce({
+      choices: [
+        {
+          message: { content: "", refusal: "I can't help with that request." },
+          finish_reason: "content_filter",
+        },
+      ],
+    });
+    await expect(
+      extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG }),
+    ).rejects.toThrow(/Model refused: I can't help/);
+  });
+});
+
+// ── countTokens with Azure backend ───────────────────────────────────────────
+
+describe("countTokens: Azure backend throws clearly", () => {
+  it("throws with a clear message when Azure backend is selected", async () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "azure-openai");
+    vi.stubEnv("AZURE_OPENAI_API_KEY", "az-key");
+    vi.stubEnv("AZURE_OPENAI_ENDPOINT", "https://test.openai.azure.com");
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    await expect(
+      countTokens({ candidate: CANDIDATE, projectName: "demo", config: CONFIG }),
+    ).rejects.toThrow(/estimate-cost.*not supported.*Azure/i);
+    expect(anthropicCtor).not.toHaveBeenCalled();
+    expect(azureOpenAICtor).not.toHaveBeenCalled();
+  });
+
+  it("throws with actionable guidance about switching to Anthropic", async () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "azure-openai");
+    vi.stubEnv("AZURE_OPENAI_API_KEY", "az-key");
+    vi.stubEnv("AZURE_OPENAI_ENDPOINT", "https://test.openai.azure.com");
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    await expect(
+      countTokens({ candidate: CANDIDATE, projectName: "demo", config: CONFIG }),
+    ).rejects.toThrow(/ANTHROPIC_API_KEY/);
+  });
+});
+
