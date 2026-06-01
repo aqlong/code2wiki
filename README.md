@@ -41,7 +41,7 @@ The output lands in `./docs/use-cases/` by default, one Markdown file per use ca
 
 ## LLM backends
 
-Code2Wiki supports two LLM backends. **Mock mode is the default** — no key needed, runs the full pipeline with placeholder text.
+Code2Wiki supports two LLM backends. **Mock mode is the default**: no key needed, runs the full pipeline with placeholder text.
 
 ### Anthropic (default for real generation)
 

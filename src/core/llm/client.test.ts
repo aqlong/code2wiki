@@ -21,7 +21,7 @@ vi.mock("@anthropic-ai/sdk", () => ({
   }),
 }));
 
-// Azure OpenAI SDK spies — hoisted so vi.mock can reference them.
+// Azure OpenAI SDK spies, hoisted so vi.mock can reference them.
 const { azureChatCreate, azureOpenAICtor } = vi.hoisted(() => ({
   azureChatCreate: vi.fn(),
   azureOpenAICtor: vi.fn(),
