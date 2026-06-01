@@ -98,6 +98,7 @@ beforeEach(() => {
   vi.stubEnv("AZURE_OPENAI_ENDPOINT", "");
   vi.stubEnv("AZURE_OPENAI_DEPLOYMENT", "");
   vi.stubEnv("AZURE_OPENAI_API_VERSION", "");
+  vi.stubEnv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "");
 });
 
 afterEach(() => {
@@ -432,6 +433,23 @@ describe("extractWithLLM, response parsing", () => {
       expect(msg).not.toContain(bad.slice(0, 201));
     }
   });
+
+  it("throws on prefixed text + fenced JSON (model adds chatty preamble)", async () => {
+    // A regression where someone "improves" parseJsonObject to greedily
+    // extract any { ... } block could silently swallow this and pretend
+    // it worked. Pin the strict-fence-only contract: the regex strips a
+    // leading fence ONLY when it's at the very start (after trim).
+    const prefixed =
+      "Here is the JSON you asked for:\n```json\n" + `{"k":"v"}` + "\n```";
+    messagesCreate.mockResolvedValueOnce(textBlocks(prefixed));
+    await expect(
+      extractWithLLM({
+        candidate: CANDIDATE,
+        projectName: "demo",
+        config: CONFIG,
+      }),
+    ).rejects.toThrow(/LLM did not return valid JSON/);
+  });
 });
 
 describe("countTokens, two-call subtract-for-system math", () => {
@@ -742,6 +760,47 @@ describe("extractWithLLM: Azure OpenAI backend", () => {
     await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
     expect(anthropicCtor).not.toHaveBeenCalled();
     expect(messagesCreate).not.toHaveBeenCalled();
+  });
+
+  it("defaults apiVersion to 2024-10-21 when AZURE_OPENAI_API_VERSION is unset", async () => {
+    vi.stubEnv("AZURE_OPENAI_API_VERSION", "");
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    expect(azureOpenAICtor).toHaveBeenCalledWith(
+      expect.objectContaining({ apiVersion: "2024-10-21" }),
+    );
+  });
+
+  it("honors AZURE_OPENAI_MAX_COMPLETION_TOKENS override (cost control for non-reasoning models)", async () => {
+    vi.stubEnv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "4096");
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    expect(azureChatCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ max_completion_tokens: 4096 }),
+    );
+  });
+
+  it("throws a length-cap diagnostic when finish_reason='length' and content is empty (o-series CoT exhausted budget)", async () => {
+    azureChatCreate.mockResolvedValueOnce({
+      choices: [{ message: { content: "" }, finish_reason: "length" }],
+    });
+    await expect(
+      extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG }),
+    ).rejects.toThrow(/finish_reason=length.*AZURE_OPENAI_MAX_COMPLETION_TOKENS/);
+  });
+
+  it("throws a refusal diagnostic when message.refusal is populated (content filter / safety system)", async () => {
+    azureChatCreate.mockResolvedValueOnce({
+      choices: [
+        {
+          message: { content: "", refusal: "I can't help with that request." },
+          finish_reason: "content_filter",
+        },
+      ],
+    });
+    await expect(
+      extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG }),
+    ).rejects.toThrow(/Model refused: I can't help/);
   });
 });
 

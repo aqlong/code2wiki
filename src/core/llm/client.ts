@@ -73,26 +73,56 @@ function validateAzureEnv(): "azure-openai" {
 
 // ── Azure OpenAI extraction ──────────────────────────────────────────────────
 
+/**
+ * Default headroom for Azure OpenAI completions. Sized for o-series reasoning
+ * models (o1, o3, gpt-5, gpt-5-mini) which consume invisible chain-of-thought
+ * tokens against this budget. Non-reasoning models (gpt-4o, gpt-4-turbo) use
+ * a fraction of this and pay only for what they emit. Override with
+ * AZURE_OPENAI_MAX_COMPLETION_TOKENS if you have a non-reasoning deployment
+ * and want to tighten the cost cap (e.g. set to 4096 to match the Anthropic
+ * path).
+ */
+const AZURE_DEFAULT_MAX_COMPLETION_TOKENS = 16384;
+
 async function extractWithAzure(
   userPrompt: string,
   config: Config,
 ): Promise<unknown> {
-  const apiKey = process.env["AZURE_OPENAI_API_KEY"]!;
-  const endpoint = process.env["AZURE_OPENAI_ENDPOINT"]!;
+  // Defensive re-check: extractWithAzure is only called via extractWithLLM →
+  // resolveBackend → validateAzureEnv, so these are validated. But if a
+  // refactor ever calls this function directly, we surface the same
+  // actionable error instead of a TypeError on the ! assertion.
+  const apiKey = process.env["AZURE_OPENAI_API_KEY"];
+  const endpoint = process.env["AZURE_OPENAI_ENDPOINT"];
+  if (!apiKey || !endpoint) {
+    throw new Error(
+      "extractWithAzure requires AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT. " +
+        "Use extractWithLLM() instead of calling this directly so backend selection is consistent.",
+    );
+  }
+
   const deployment =
     process.env["AZURE_OPENAI_DEPLOYMENT"] || config.model || "gpt-4o";
   const apiVersion =
     process.env["AZURE_OPENAI_API_VERSION"] || "2024-10-21";
 
+  // Configurable completion budget. Reasoning models burn most of it on
+  // invisible CoT; standard models barely touch it. Default sized for the
+  // reasoning case.
+  const maxCompletionTokens = Number(
+    process.env["AZURE_OPENAI_MAX_COMPLETION_TOKENS"] ||
+      AZURE_DEFAULT_MAX_COMPLETION_TOKENS,
+  );
+
   const client = new AzureOpenAI({ apiKey, endpoint, deployment, apiVersion });
 
+  // Note: Azure OpenAI auto-caches prompt prefixes >= 1024 tokens for
+  // qualifying models (gpt-4o, o1, etc.). The SYSTEM_PROMPT is the stable
+  // prefix here so caching kicks in automatically without an explicit
+  // cache_control field (unlike Anthropic, where it must be opt-in).
   const response = await client.chat.completions.create({
     model: deployment,
-    // Reasoning models (o-series) consume internal chain-of-thought tokens that
-    // count against max_completion_tokens but are not visible in the response.
-    // 4096 is enough for standard models but leaves almost nothing for o-series
-    // models after reasoning. 16384 gives comfortable headroom for both.
-    max_completion_tokens: 16384,
+    max_completion_tokens: maxCompletionTokens,
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: userPrompt },
@@ -106,7 +136,9 @@ async function extractWithAzure(
   if (!text) {
     const detail = refusal
       ? `Model refused: ${refusal}`
-      : `finish_reason=${finishReason ?? "unknown"}. The file may be too large for the model's context window. Try a smaller file or a model with a larger context.`;
+      : finishReason === "length"
+        ? `finish_reason=length: the model exhausted its max_completion_tokens budget (${maxCompletionTokens}) before emitting any visible output. This usually means the file is too large for the model's context window OR (for o-series reasoning models) the reasoning chain consumed the entire budget. Try a larger AZURE_OPENAI_MAX_COMPLETION_TOKENS, a smaller file, or a non-reasoning deployment.`
+        : `finish_reason=${finishReason ?? "unknown"}.`;
     throw new Error(`Azure OpenAI returned empty content. ${detail}`);
   }
 

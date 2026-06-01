@@ -171,7 +171,7 @@ export async function runGenerate(opts: GenerateOptions): Promise<void> {
   const backendLabel =
     !usingMock && (process.env["CODE2WIKI_LLM_BACKEND"] === "azure-openai" ||
       (process.env["AZURE_OPENAI_API_KEY"] && !process.env["ANTHROPIC_API_KEY"]))
-      ? `Azure OpenAI (${process.env["AZURE_OPENAI_DEPLOYMENT"] ?? config.model})`
+      ? `Azure OpenAI (${process.env["AZURE_OPENAI_DEPLOYMENT"] || config.model})`
       : config.model;
 
   console.log(
