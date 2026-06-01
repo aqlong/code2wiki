@@ -60,6 +60,7 @@ If your team routes external AI traffic through Azure OpenAI, set these env vars
 | `AZURE_OPENAI_ENDPOINT` | ✅ | e.g. `https://my-resource.openai.azure.com` |
 | `AZURE_OPENAI_DEPLOYMENT` | optional | Deployment name (defaults to `config.model`) |
 | `AZURE_OPENAI_API_VERSION` | optional | Defaults to `2024-10-21` |
+| `AZURE_OPENAI_MAX_COMPLETION_TOKENS` | optional | Defaults to `16384`. Set lower (e.g. `4096`) for non-reasoning deployments like `gpt-4o` to tighten cost; leave at default for o-series reasoning models (`o1`, `o3`, `gpt-5`, `gpt-5-mini`) which consume invisible chain-of-thought tokens against this budget |
 | `CODE2WIKI_LLM_BACKEND` | optional | Force `azure-openai` or `anthropic`; omit for auto-detect |
 
 **Auto-detect rules** (in priority order):
@@ -78,9 +79,12 @@ export AZURE_OPENAI_DEPLOYMENT=gpt-4o
 code2wiki generate --cwd /path/to/your/project
 ```
 
-> **Note:** `--estimate-cost` requires `ANTHROPIC_API_KEY` and is not available when the Azure backend is active (Azure OpenAI does not expose a non-billed token-counting endpoint equivalent to Anthropic's `messages.countTokens`).
+> **Notes:**
+> - `--estimate-cost` requires `ANTHROPIC_API_KEY` and is not available when the Azure backend is active (Azure OpenAI does not expose a non-billed token-counting endpoint equivalent to Anthropic's `messages.countTokens`).
+> - For o-series reasoning models, very large source files can exhaust `max_completion_tokens` on internal reasoning alone, producing an empty response. The error message will say `finish_reason=length`; raise `AZURE_OPENAI_MAX_COMPLETION_TOKENS` or split the file.
+> - Retries (2x with exponential backoff) on transient 429/500 errors are handled automatically by the underlying `openai` SDK.
 
-
+## Languages supported (today)
 
 | Language | Parser | Status |
 |---|---|---|
