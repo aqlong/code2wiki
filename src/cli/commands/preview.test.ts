@@ -581,4 +581,204 @@ The auth step delegates to the legacy checker. [^auth]
       await fs.rm(customParent, { recursive: true, force: true });
     }
   });
+
+  // Local-tz timestamp script: every per-page render and the index MUST
+  // ship the inline <script> that rewrites bare ISO-8601 UTC timestamps
+  // (banner "Last synced", LLM-generated body footers, index "Generated")
+  // into the viewer's local time. A regression dropping the injection
+  // would leave reviewers staring at raw `2026-06-01T15:09:22.047Z`,
+  // exactly the operator complaint that motivated the change.
+  it("injects the local-tz <script> + <time data-c2w-localize> banner into per-page renders AND the index", async () => {
+    const outDir = path.join(dir, "docs", "use-cases");
+    await fs.mkdir(outDir, { recursive: true });
+    await fs.writeFile(
+      path.join(outDir, "page-one.md"),
+      SAMPLE_PAGE("page-one", "Page One"),
+      "utf-8",
+    );
+    captureConsole();
+
+    await runPreview({ cwd: dir });
+
+    const previewDir = path.join(dir, ".code2wiki", "preview");
+    const cfHtml = await fs.readFile(
+      path.join(previewDir, "page-one", "confluence.html"),
+      "utf-8",
+    );
+    const ntHtml = await fs.readFile(
+      path.join(previewDir, "page-one", "notion.html"),
+      "utf-8",
+    );
+    const idxHtml = await fs.readFile(
+      path.join(previewDir, "index.html"),
+      "utf-8",
+    );
+
+    // Banner ISO is wrapped in <time data-c2w-localize> so the script
+    // has something to rewrite. Pin the marker attribute, not the
+    // exact timestamp (which is taken from frontmatter).
+    expect(cfHtml).toMatch(/<time data-c2w-localize datetime="[^"]+"[^>]*>/);
+    expect(ntHtml).toMatch(/<time data-c2w-localize datetime="[^"]+"[^>]*>/);
+
+    // The localize script appears on every surface. Pin a stable
+    // substring inside it so a refactor that renames the function but
+    // keeps behavior still passes.
+    for (const html of [cfHtml, ntHtml, idxHtml]) {
+      expect(html).toContain("data-c2w-localize");
+      expect(html).toContain("Intl.DateTimeFormat");
+      expect(html).toContain("toLocaleString");
+    }
+
+    // Index "Generated" timestamp is also wrapped, not bare.
+    expect(idxHtml).toMatch(
+      /<time data-c2w-localize datetime="\d{4}-\d{2}-\d{2}T[^"]+"[^>]*>/,
+    );
+  });
+
+  // Index groups pages by their source-file top-level folder, so a
+  // multi-module repo (e.g. Reports/, Time/, Sales/) doesn't render as
+  // one flat alphabetical wall. The group label MUST appear as an
+  // <h2> and each page MUST be nested under its own group, not a
+  // sibling group: a regression putting every page under the first
+  // group's <ul> would still pass the multi-page-listing test (since
+  // every slug is present) but break the operator-facing organization
+  // this commit was built for.
+  it("index.html groups pages by their source_files[0] top-level folder with per-group counts", async () => {
+    const outDir = path.join(dir, "docs", "use-cases");
+    await fs.mkdir(outDir, { recursive: true });
+    const reportPage = (slug: string, title: string): string => `---
+code2wiki_id: ${slug}-v1
+title: ${title}
+slug: ${slug}
+actor: An internal application caller
+status: active
+last_generated: 2026-05-13T00:00:00Z
+last_commit: 0000000
+confidence: high
+source_files:
+  - path: Reports/${slug}.cfc
+    lines: 1-3
+tags: []
+---
+
+<!-- code2wiki:managed:start id=${slug}-v1 -->
+
+## Summary
+
+Sample.
+
+<!-- code2wiki:managed:end -->
+`;
+    const timePage = `---
+code2wiki_id: time-clock-v1
+title: Time Clock
+slug: time-clock
+actor: An internal application caller
+status: active
+last_generated: 2026-05-13T00:00:00Z
+last_commit: 0000000
+confidence: high
+source_files:
+  - path: Time/clock.cfc
+    lines: 1-3
+tags: []
+---
+
+<!-- code2wiki:managed:start id=time-clock-v1 -->
+
+## Summary
+
+Sample.
+
+<!-- code2wiki:managed:end -->
+`;
+    await fs.writeFile(
+      path.join(outDir, "report-a.md"),
+      reportPage("report-a", "Report A"),
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(outDir, "report-b.md"),
+      reportPage("report-b", "Report B"),
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(outDir, "time-clock.md"),
+      timePage,
+      "utf-8",
+    );
+    captureConsole();
+
+    await runPreview({ cwd: dir });
+
+    const idxHtml = await fs.readFile(
+      path.join(dir, ".code2wiki", "preview", "index.html"),
+      "utf-8",
+    );
+
+    // Two group headers, with the correct counts in the trailing span.
+    expect(idxHtml).toMatch(/<h2>Reports <span class="count">\(2\)<\/span><\/h2>/);
+    expect(idxHtml).toMatch(/<h2>Time <span class="count">\(1\)<\/span><\/h2>/);
+
+    // Reports group MUST come BEFORE Time (alphabetical group sort).
+    const reportsIdx = idxHtml.indexOf("<h2>Reports");
+    const timeIdx = idxHtml.indexOf("<h2>Time");
+    expect(reportsIdx).toBeGreaterThan(-1);
+    expect(timeIdx).toBeGreaterThan(reportsIdx);
+
+    // Each page's link is still present (groups don't drop pages).
+    for (const slug of ["report-a", "report-b", "time-clock"]) {
+      expect(idxHtml).toContain(`href="${slug}/confluence.html"`);
+    }
+
+    // Page-count is exposed in the preamble (used by ops to sanity-
+    // check a generate run produced the expected output volume).
+    expect(idxHtml).toMatch(/3 page\(s\)/);
+  });
+
+  // A page whose source_files[0] path has no folder separator (file at
+  // the repo root) is bucketed under "(root)" so it never leaks into
+  // an arbitrary other group's <ul>. Pins the `parts.length > 1`
+  // branch that distinguishes the two cases.
+  it("buckets pages whose first source file is at the repo root under the (root) group", async () => {
+    const outDir = path.join(dir, "docs", "use-cases");
+    await fs.mkdir(outDir, { recursive: true });
+    await fs.writeFile(
+      path.join(outDir, "bare.md"),
+      `---
+code2wiki_id: bare-v1
+title: Bare File
+slug: bare
+actor: An internal application caller
+status: active
+last_generated: 2026-05-13T00:00:00Z
+last_commit: 0000000
+confidence: high
+source_files:
+  - path: bare.cfc
+    lines: 1-3
+tags: []
+---
+
+<!-- code2wiki:managed:start id=bare-v1 -->
+
+## Summary
+
+Bare root file.
+
+<!-- code2wiki:managed:end -->
+`,
+      "utf-8",
+    );
+    captureConsole();
+
+    await runPreview({ cwd: dir });
+
+    const idxHtml = await fs.readFile(
+      path.join(dir, ".code2wiki", "preview", "index.html"),
+      "utf-8",
+    );
+    expect(idxHtml).toMatch(/<h2>\(root\) <span class="count">\(1\)<\/span><\/h2>/);
+    expect(idxHtml).toContain(`href="bare/confluence.html"`);
+  });
 });
