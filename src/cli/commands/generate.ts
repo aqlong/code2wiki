@@ -91,9 +91,6 @@ export async function runGenerate(opts: GenerateOptions): Promise<void> {
   let candidates = await scanProject(opts.cwd, config);
 
 
-  // of their sibling code-behind files so the LLM receives both halves. Runs
-  // before any filter so code-behind candidates aren't lost if --only / --name
-
   // First-run friction guard: when the scan yields zero candidates we used to
   // fall through to a terse "No candidates to process." and exit, which on a
   // wrong --cwd is indistinguishable from "tool is broken." Print WHERE we
@@ -192,6 +189,7 @@ export async function runGenerate(opts: GenerateOptions): Promise<void> {
     );
     return;
   }
+
 
   // --estimate-cost: project the run's input + output token cost and
   // exit BEFORE any LLM call or filesystem write. Placed here (after

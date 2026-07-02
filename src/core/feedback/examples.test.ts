@@ -16,16 +16,19 @@ import {
 // examples/ regression suite
 // ----------------------------------------------------------------------------
 //
-// For every examples/<name>/ directory containing both expected.md and
-// baseline.snapshot.json, recompute the structural snapshot from the
-// expected.md and assert it matches the committed baseline.
+// For every expected*.md file in every examples/<name>/ directory that has a
+// matching baseline*.snapshot.json, recompute the structural snapshot and
+// assert it matches the committed baseline.
+//
+// Covers the primary expected.md and any per-use-case variants such as
+// expected-edit-post.md / expected-delete-post.md (Django example, ADR-037).
 //
 // This is the cheapest, fastest layer of the self-learning quality gate
 // (docs/self-learning.md signal #2). It runs in mock mode (no LLM, no
 // network) and catches:
 //
-//   - Accidental edits to a hand-curated example (expected.md changed
-//     but baseline.snapshot.json wasn't regenerated → drift)
+//   - Accidental edits to a hand-curated example (expected*.md changed
+//     but baseline*.snapshot.json wasn't regenerated → drift)
 //   - Snapshot algorithm changes that affect the public surface (e.g.,
 //     new section parser, frontmatter key normalization)
 //   - File encoding / BOM / CRLF regressions that would otherwise only
@@ -33,7 +36,7 @@ import {
 //
 // To intentionally update a baseline after a curated example changes:
 //   npx tsx scripts/gen-baseline-snapshots.mjs
-// then commit the new baseline.snapshot.json files alongside the expected.md.
+// then commit the updated baseline*.snapshot.json files alongside the expected*.md.
 
 // Resolve examples/ relative to this test file so the test works from any cwd.
 const examplesDir = fileURLToPath(new URL("../../../examples/", import.meta.url));
@@ -46,19 +49,22 @@ interface ExampleCase {
 
 function findExamples(): ExampleCase[] {
   if (!existsSync(examplesDir)) return [];
-  return readdirSync(examplesDir)
-    .filter((n) => {
-      const p = join(examplesDir, n);
-      return statSync(p).isDirectory();
-    })
-    .map((name) => ({
-      name,
-      expectedPath: join(examplesDir, name, "expected.md"),
-      baselinePath: join(examplesDir, name, "baseline.snapshot.json"),
-    }))
-    .filter(
-      (c) => existsSync(c.expectedPath) && existsSync(c.baselinePath),
-    );
+  const cases: ExampleCase[] = [];
+  for (const dirName of readdirSync(examplesDir)) {
+    const dirPath = join(examplesDir, dirName);
+    if (!statSync(dirPath).isDirectory()) continue;
+    for (const file of readdirSync(dirPath)) {
+      if (!/^expected.*\.md$/.test(file)) continue;
+      const baselineFile = file
+        .replace(/^expected/, "baseline")
+        .replace(/\.md$/, ".snapshot.json");
+      const expectedPath = join(dirPath, file);
+      const baselinePath = join(dirPath, baselineFile);
+      if (!existsSync(baselinePath)) continue;
+      cases.push({ name: `${dirName}/${file}`, expectedPath, baselinePath });
+    }
+  }
+  return cases;
 }
 
 const cases = findExamples();
@@ -72,7 +78,7 @@ describe("examples/ structural snapshot regression", () => {
   });
 
   it.each(cases)(
-    "$name: expected.md snapshot matches baseline.snapshot.json",
+    "$name snapshot matches baseline",
     ({ expectedPath, baselinePath }) => {
       const expectedText = readFileSync(expectedPath, "utf8");
       const baseline = JSON.parse(

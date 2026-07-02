@@ -423,6 +423,14 @@ describe("validateUseCaseDraft tag jargon blocklist", () => {
             confidence_reason: `Source code is clear${em}see lines 45-78.`,
           }),
         },
+        {
+          // tags render into the page's YAML frontmatter (renderer.ts ~31
+          // `tags: useCase.tags`), so an em dash in an LLM-produced tag is
+          // shipped to the customer's wiki and must trip the runtime defense.
+          field: "tags",
+          mutator: () =>
+            ({ tags: [`pre${em}checkout`] }) as Partial<typeof GOOD>,
+        },
       ];
 
     for (const { field, mutator } of cases) {
@@ -743,6 +751,24 @@ describe("validateNotesPropagated", () => {
     ).toEqual([]);
   });
 
+  it("does not flag the CFML 'access: remote' note despite its 'remote'/'http' substrings", () => {
+    // `access: remote (HTTP-callable via CFC remoting)` (cfml.ts) is an
+    // actor-inference note, not a side effect. It is the riskiest
+    // access-control note to leave unpinned: its text contains both "remote"
+    // AND "http", which are keywords for the "Makes outbound HTTP request"
+    // category. The validator is safe only because findKeywordsFor classifies
+    // a note by note.startsWith(prefix), so a note that merely CONTAINS a
+    // keyword is skipped. A regression that classified notes by keyword-content
+    // instead (keywords.some((k) => note.includes(k))) would falsely warn here,
+    // and here alone among the access-control notes, since auth:/roles:/
+    // before_action:/permission_classes: carry no compliance keyword. Pin it.
+    expect(
+      validateNotesPropagated({} as any, [
+        "access: remote (HTTP-callable via CFC remoting)",
+      ]),
+    ).toEqual([]);
+  });
+
   it("partial coverage: emits issues only for missing notes, not the present ones", () => {
     const draft = {
       business_rules: [{ rule: "All writes happen atomically inside a transaction." }],
@@ -781,7 +807,7 @@ describe("validateNotesPropagated", () => {
     // across the 8 families that ship a suffixed form. The variants were
     // harvested directly from grepping `notes.push(...)` /
     // `sideEffects.push(...)` strings in
-    // src/core/parsers/{java,csharp,ruby,django,cfml}.ts so the fixture stays
+    // src/core/parsers/{java,unknown,ruby,django,cfml}.ts so the fixture stays
     // ground-truthed against what the parsers actually emit.
     //
     // Regression scenario this defends against: a future refactor of
@@ -1018,7 +1044,6 @@ describe("validateNotesPropagated", () => {
     // "unrecoverable" once written, so silently dropping a keyword here means
     // the validator stops surfacing this compliance signal for whichever LLM
     // phrasing maps to that keyword. All five parsers (Java / CFML / Python /
-    // Ruby / C#) surface file-system writes.
     const cases: Array<{ keyword: string; rule: string }> = [
       {
         keyword: "file",
@@ -1261,7 +1286,6 @@ describe("validateNotesPropagated", () => {
     // side effect "unrecoverable" once delivered, so silently dropping a
     // keyword here means the validator stops surfacing the compliance signal
     // for whichever LLM phrasing maps to that keyword. CFML cfmail / Java
-    // JavaMailSender / Ruby ActionMailer / Django mail / C# SmtpClient all
     // emit a "Sends email" prefix per the CLAUDE.md side-effect matrix.
     //
     // 4 of 5 keywords are cleanly isolated by construction (probe at
@@ -1310,7 +1334,6 @@ describe("validateNotesPropagated", () => {
     //   "Executes within a database transaction"            (Java @Transactional,
     //                                                        Ruby ActiveRecord,
     //                                                        Django transaction.atomic,
-    //                                                        C# TransactionScope /
     //                                                        BeginTransaction)
     //   "Executes database operations inside a transaction" (CFML cftransaction)
     // Both arrays MUST stay in sync, the validator's findKeywordsFor() picks
@@ -1359,6 +1382,13 @@ describe("validateNotesPropagated", () => {
         ).toEqual([]);
       }
     }
+    // Structural parity pin: both prefixes share ONE keyword array
+    // (TRANSACTION_KEYWORDS in validator.ts), so they are the same reference.
+    // Re-inlining a literal array on either entry desyncs the pair and fails
+    // here even before the per-keyword cases above can drift.
+    expect(NOTE_KEYWORDS["Executes within a database transaction"]).toBe(
+      NOTE_KEYWORDS["Executes database operations inside a transaction"],
+    );
   });
 
   it("matches spring-event keywords across publish-subscribe vocabulary", () => {
@@ -1466,7 +1496,7 @@ describe("validateNotesPropagated", () => {
     // The SYSTEM_PROMPT STORED PROCEDURES section flags these as a
     // compliance signal because the business logic happens INSIDE the
     // database, outside the application's audit / observability surface.
-    // All 5 parsers (java/csharp/django/ruby/cfml via cfstoredproc) surface
+    // All 5 parsers (java/unknown/django/ruby/cfml via cfstoredproc) surface
     // the "Calls stored procedure" note as of 2026-05-24's matrix sweep
     // (c13a735 / 6b2bd31 / d0858d5 / 93cc035 plus historical cfml support);
     // the validator side previously had zero per-category coverage to
@@ -1588,6 +1618,16 @@ describe("validateNotesPropagated", () => {
       {
         keyword: "topic",
         rule: "Completed orders are published to the orders topic.",
+      },
+      // the broker note using the product name only, without any of the 8
+      // generic keywords above; these two cases pin that those renderings match.
+      {
+        keyword: "service bus",
+        rule: "The receipt is dispatched to the azure service bus for downstream subscribers.",
+      },
+      {
+        keyword: "masstransit",
+        rule: "Order events are published through masstransit to consuming services.",
       },
     ];
     for (const { keyword, rule } of cases) {

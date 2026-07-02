@@ -1,14 +1,22 @@
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-const execAsync = promisify(exec);
+// execFile (NOT exec) so git args are passed as an argv array with no shell
+// in between. The `ref` in changedFilesSince comes from the operator's
+// `--since <ref>` flag; a shell-string `git diff ... ${ref} ...` would let a
+// ref carrying shell metacharacters (e.g. "HEAD; rm -rf ~") break out of the
+// git command and execute. argv passing makes the ref a single literal
+// argument git either resolves or rejects, never a command boundary.
+const execFileAsync = promisify(execFile);
 
 /** Best-effort: get the short SHA of HEAD. Returns 'unknown' if not in a git repo. */
 export async function currentCommit(cwd: string): Promise<string> {
   try {
-    const { stdout } = await execAsync("git rev-parse --short HEAD", {
-      cwd,
-    });
+    const { stdout } = await execFileAsync(
+      "git",
+      ["rev-parse", "--short", "HEAD"],
+      { cwd },
+    );
     return stdout.trim() || "unknown";
   } catch {
     return "unknown";
@@ -31,19 +39,11 @@ export async function changedFilesSince(
   ref: string,
 ): Promise<string[] | null> {
   try {
-    if (ref === "uncommitted") {
-      const { stdout } = await execAsync(`git diff --name-only HEAD`, {
-        cwd,
-      });
-      return stdout
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean);
-    }
-    const { stdout } = await execAsync(
-      `git diff --name-only ${ref} HEAD`,
-      { cwd },
-    );
+    const args =
+      ref === "uncommitted"
+        ? ["diff", "--name-only", "HEAD"]
+        : ["diff", "--name-only", ref, "HEAD"];
+    const { stdout } = await execFileAsync("git", args, { cwd });
     return stdout
       .split("\n")
       .map((l) => l.trim())

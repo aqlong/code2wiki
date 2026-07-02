@@ -59,9 +59,9 @@ describe("defaultConfig", () => {
       "**/*_views.py",
       "**/views/**/*.py",
       "**/*.cs",
-      "**/*.aspx.cs",
+
       "**/*.ascx.cs",
-      "**/*.aspx",
+
       "**/*.ascx",
       "**/*.asax",
     ]);

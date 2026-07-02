@@ -263,6 +263,47 @@ describe("NotionPublisher", () => {
     expect(calls.some((c) => c.method === "POST" && c.url.endsWith("/pages"))).toBe(true);
   });
 
+  it("strips leading YAML frontmatter before rendering blocks (parity with Confluence; never leaks frontmatter keys)", async () => {
+    // The publish command hands the whole generated .md file (frontmatter
+    // included) to the publisher as page.markdown. bodyMarkdown() must strip it
+    // via the shared stripFrontmatter() helper before markdownToNotionBlocks()
+    // runs; otherwise code2wiki_id:/title:/confidence: lines leak as visible
+    // paragraph/heading blocks on every published Notion page. Confluence got
+    // this end-to-end guard in 0956532; this is the missing Notion half (a
+    // refactor dropping stripFrontmatter from bodyMarkdown passes every other
+    // Notion test because none of them feed a frontmatter-bearing page).
+    // Reverse-validate: revert bodyMarkdown() to `page.markdown` and the
+    // DO_NOT_LEAK_ME assertion fails.
+    let createBody: { children?: unknown[] } | undefined;
+    const fetch = buildBodyCaptureFetch((url, method, body) => {
+      if (method === "POST" && url.endsWith(`/databases/${CFG.databaseId}/query`)) {
+        return { status: 200, body: { results: [] } };
+      }
+      if (method === "POST" && url.endsWith("/pages")) {
+        createBody = body as typeof createBody;
+        return { status: 200, body: { id: "fm-1", url: "https://notion.so/fm-1", archived: false } };
+      }
+      return { status: 404, body: {} };
+    });
+    const pageWithFrontmatter: PageInput = {
+      ...SAMPLE_PAGE,
+      markdown:
+        "---\ncode2wiki_id: java-foo-bar-v1\ntitle: Foo Bar\nslug: foo-bar\nconfidence: high\nx_frontmatter_sentinel: DO_NOT_LEAK_ME\n---\n\n## Summary\n\nReal body paragraph.\n",
+    };
+    const pub = new NotionPublisher(CFG, { fetch });
+    const [result] = await pub.publish([pageWithFrontmatter]);
+    expect(result?.outcome).toBe("created");
+
+    // Assert against the created page's child blocks only (sentinels below are
+    // never written to Notion page properties, so a hit means a body leak).
+    const childrenJson = JSON.stringify(createBody?.children ?? []);
+    expect(childrenJson).toContain("Summary"); // body content survives the strip
+    expect(childrenJson).toContain("Real body paragraph.");
+    expect(childrenJson).not.toContain("DO_NOT_LEAK_ME"); // frontmatter never rendered
+    expect(childrenJson).not.toContain("x_frontmatter_sentinel");
+    expect(childrenJson).not.toContain("confidence: high");
+  });
+
   it("updates an existing page when query returns a match", async () => {
     const { fetch, calls } = mockFetch(({ url, method }) => {
       if (method === "POST" && url.endsWith(`/databases/${CFG.databaseId}/query`)) {

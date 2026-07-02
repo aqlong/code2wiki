@@ -793,6 +793,117 @@ end
     const cs = candidates(source);
     expect(cs[0]?.hints.notes).toEqual(["before_action: :login_required"]);
   });
+
+  it("skip_before_action without only/except removes callback from all actions", () => {
+    const source = `
+class PostsController < ApplicationController
+  before_action :authenticate_user!
+  skip_before_action :authenticate_user!
+
+  def index
+    @posts = Post.all
+  end
+  def create
+    @post = Post.new
+  end
+end
+`;
+    const cs = candidates(source);
+    const byName = Object.fromEntries(cs.map((c) => [c.name.split("#")[1], c]));
+    expect(byName["index"]?.hints.notes).toBeUndefined();
+    expect(byName["create"]?.hints.notes).toBeUndefined();
+  });
+
+  it("skip_before_action with only: removes callback from listed actions only", () => {
+    const source = `
+class PostsController < ApplicationController
+  before_action :authenticate_user!
+  skip_before_action :authenticate_user!, only: [:index, :show]
+
+  def index
+    @posts = Post.all
+  end
+  def show
+    @post = Post.find(params[:id])
+  end
+  def create
+    @post = Post.new(post_params)
+  end
+end
+`;
+    const cs = candidates(source);
+    const byName = Object.fromEntries(cs.map((c) => [c.name.split("#")[1], c]));
+    expect(byName["index"]?.hints.notes).toBeUndefined();
+    expect(byName["show"]?.hints.notes).toBeUndefined();
+    expect(byName["create"]?.hints.notes).toEqual(["before_action: :authenticate_user!"]);
+  });
+
+  it("skip_before_action with except: removes callback from all actions not in the list", () => {
+    const source = `
+class ArticlesController < ApplicationController
+  before_action :require_subscription
+  skip_before_action :require_subscription, except: [:create, :update]
+
+  def index
+    @articles = Article.all
+  end
+  def create
+    @article = Article.new
+  end
+  def update
+    @article = Article.find(params[:id])
+  end
+end
+`;
+    const cs = candidates(source);
+    const byName = Object.fromEntries(cs.map((c) => [c.name.split("#")[1], c]));
+    expect(byName["index"]?.hints.notes).toBeUndefined();
+    expect(byName["create"]?.hints.notes).toEqual(["before_action: :require_subscription"]);
+    expect(byName["update"]?.hints.notes).toEqual(["before_action: :require_subscription"]);
+  });
+
+  it("skip_before_action does not affect a different callback", () => {
+    const source = `
+class UsersController < ApplicationController
+  before_action :authenticate_user!
+  before_action :verify_email
+  skip_before_action :verify_email, only: [:index]
+
+  def index
+    @users = User.all
+  end
+  def edit
+    @user = User.find(params[:id])
+  end
+end
+`;
+    const cs = candidates(source);
+    const byName = Object.fromEntries(cs.map((c) => [c.name.split("#")[1], c]));
+    // index: authenticate_user! still applies; verify_email is skipped
+    expect(byName["index"]?.hints.notes).toEqual(["before_action: :authenticate_user!"]);
+    // edit: both callbacks apply
+    expect(byName["edit"]?.hints.notes).toEqual(["before_action: :authenticate_user!, :verify_email"]);
+  });
+
+  it("accepts skip_before_filter as a synonym for skip_before_action", () => {
+    const source = `
+class LegacyController < ApplicationController
+  before_filter :login_required
+  skip_before_filter :login_required, only: [:index]
+
+  def index
+    @records = Record.all
+  end
+  def create
+    @record = Record.new
+  end
+end
+`;
+    const cs = candidates(source);
+    const byName = Object.fromEntries(cs.map((c) => [c.name.split("#")[1], c]));
+    expect(byName["index"]?.hints.notes).toBeUndefined();
+    expect(byName["create"]?.hints.notes).toEqual(["before_action: :login_required"]);
+  });
 });
 
 // ---- ActiveRecord model extraction (databaseTables) ---------------------
@@ -1140,6 +1251,8 @@ class ImportController < ApplicationController
     contents = File.read("/tmp/in.csv")
     lines = File.readlines("/tmp/other.csv")
     exists = File.exist?("/tmp/x.csv")
+    raw = IO.read("/tmp/raw.csv")
+    bin = IO.binread("/tmp/raw.bin")
     head :ok
   end
 end
@@ -1147,6 +1260,22 @@ end
     const cs = candidates(source);
     const notes = cs[0]?.hints.notes ?? [];
     expect(notes.some((n) => n === "Writes to file system")).toBe(false);
+  });
+
+  it("surfaces 'Writes to file system' for IO.write / File.binwrite / IO.binwrite one-shot writers", () => {
+    for (const call of ["IO.write(path, data)", "File.binwrite(path, bytes)", "IO.binwrite(path, bytes)"]) {
+      const source = `
+class T < ApplicationController
+  def run
+    ${call}
+    head :ok
+  end
+end
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${call} should emit filesystem note`).toContain("Writes to file system");
+    }
   });
 
   it("File mutator regex covers all 7 alternatives", () => {

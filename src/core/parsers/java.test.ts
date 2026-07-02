@@ -1593,7 +1593,6 @@ public class PingController {
 // using ONLY that alternative -- a real customer mis-generation regression
 // decoupled from any test surface.
 //
-// Pattern mirrors the C# ACTION_RETURN_TYPES pin at csharp.test.ts (01e60b9)
 // and the Ruby AR_CLASS_METHODS pin at ruby.test.ts (ce63ba4): one it-block
 // per regex with a for-loop over the alternatives, each fixture isolated so
 // only that one alternative appears in methodSource. Each alternative
@@ -2137,7 +2136,6 @@ public class PingController {
 describe("parseJava: background-job notes (@Async / TaskExecutor / CompletableFuture)", () => {
   // Spring Boot and Java 8+ offer three canonical fire-and-forget patterns;
   // all three are audit-critical because downstream effects happen in a worker
-  // thread, out of band with the current request. Mirrors C# Hangfire
   // (BackgroundJob.Enqueue), Ruby ActiveJob (perform_later / perform_async),
   // and Django Celery (.delay / .apply_async).
 
@@ -2300,7 +2298,6 @@ describe("parseJava: stored procedure notes (JPA / JDBC / SimpleJdbcCall)", () =
   // Stored procs may have side effects invisible in the Java code (triggers,
   // cross-table writes, audit logging in the DB layer), so compliance readers
   // need them surfaced as business rules. Mirrors CFML's <cfstoredproc> note
-  // and C#'s CommandType.StoredProcedure note.
 
   it("surfaces stored-procedure note for JPA EntityManager.createStoredProcedureQuery", () => {
     const source = `package com.example;

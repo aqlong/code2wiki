@@ -197,6 +197,57 @@ describe("ConfluencePublisher", () => {
     expect(calls.some((c) => c.method === "POST" && c.url.endsWith("/rest/api/content"))).toBe(true);
   });
 
+  it("strips YAML frontmatter so its keys never render as body text", async () => {
+    // The `publish` command hands the whole .md file (frontmatter included)
+    // to the publisher as page.markdown. Without stripFrontmatter() the keys
+    // leak as a visible heading on every Confluence page. Regression guard.
+    const fmPage: PageInput = {
+      ...SAMPLE_PAGE,
+      markdown:
+        "---\n" +
+        "code2wiki_id: java-foo-bar-v1\n" +
+        "title: Foo Bar Use Case\n" +
+        "slug: foo-bar-use-case\n" +
+        "tags: [foo, bar]\n" +
+        "confidence: high\n" +
+        "---\n\n" +
+        "## Summary\n\nA quick test.\n",
+    };
+    const { fetch, calls } = mockFetch(({ url, method }) => {
+      if (url.includes("/rest/api/content/search")) {
+        return { status: 200, body: { results: [] } };
+      }
+      if (method === "POST" && url.endsWith("/rest/api/content")) {
+        return {
+          status: 200,
+          body: {
+            id: "new-page-1",
+            type: "page",
+            title: "Foo Bar Use Case",
+            version: { number: 1 },
+            _links: { webui: "/spaces/DOCS/pages/new-page-1", base: CFG.baseUrl },
+          },
+        };
+      }
+      return { status: 404, body: {} };
+    });
+    const pub = new ConfluencePublisher(CFG, { fetch });
+    const [result] = await pub.publish([fmPage]);
+    expect(result?.outcome).toBe("created");
+    const post = calls.find(
+      (c) => c.method === "POST" && c.url.endsWith("/rest/api/content"),
+    );
+    const storage = (post?.body as { body: { storage: { value: string } } })
+      .body.storage.value;
+    // Frontmatter keys must NOT appear anywhere in the rendered storage.
+    expect(storage).not.toContain("code2wiki_id:");
+    expect(storage).not.toContain("confidence: high");
+    expect(storage).not.toContain("tags: [foo, bar]");
+    // The real body still renders.
+    expect(storage).toContain("Summary");
+    expect(storage).toContain("A quick test.");
+  });
+
   it("updates an existing page when the search returns one", async () => {
     const { fetch, calls } = mockFetch(({ url, method }) => {
       if (url.includes("/rest/api/content/search")) {

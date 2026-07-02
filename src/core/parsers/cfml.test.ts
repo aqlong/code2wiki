@@ -949,6 +949,24 @@ describe("parseCfml, ORM call hints", () => {
       ),
     ).toBe(false);
   });
+
+  it("accumulates the plugin-events note alongside the ORM note", () => {
+    // The plugin-events branch is the only note block that historically
+    // assigned hints.notes directly instead of spreading the prior value;
+    // every other branch appends. This pins the accumulation contract so a
+    // future reorder that puts another note block before the events branch
+    // can never silently clobber it.
+    const source = `<cfcomponent>
+  <cffunction name="publishPost">
+    <cfset entitySave(post)>
+    <cfset announceEvent("postPublished", { id = post.getId() })>
+  </cffunction>
+</cfcomponent>`;
+    const candidates = parseCfml("/x/PostSvc.cfc", "PostSvc.cfc", source);
+    const notes = candidates[0]!.hints.notes ?? [];
+    expect(notes.some((n) => n.startsWith("Calls ORM functions:"))).toBe(true);
+    expect(notes.some((n) => n.startsWith("Fires plugin events:"))).toBe(true);
+  });
 });
 
 describe("parseCfml, custom tag invocation hints", () => {
@@ -1677,7 +1695,6 @@ describe("parseCfml, cffile filesystem side-effect hints", () => {
 
 describe("parseCfml, cfexecute process-execution side-effect hints", () => {
   // Closes the process-execution matrix opened by Java Runtime.exec /
-  // ProcessBuilder (a0ac408), C# Process.Start / Cli.Wrap (56bcd71),
   // Ruby system / Open3 (1a944a1), Django subprocess / os.system (1c60c72).
   // Audit signal: spawned processes inherit server privileges -- the most
   // common ColdFusion idiom is shelling out to wkhtmltopdf / ImageMagick /
@@ -1712,7 +1729,7 @@ describe("parseCfml, cfexecute process-execution side-effect hints", () => {
     // that a refactor narrowing the alternation (e.g. dropping the function
     // form during a tag-only audit) trips exactly one assertion with a label
     // naming the broken alternative. Mirrors the per-alt loop idiom used for
-    // every other side-effect matrix (java/csharp/ruby/django process-execution
+    // every other side-effect matrix (java/unknown/ruby/django process-execution
     // and the cfml cftransaction / cffile / cfcache pin sweeps).
     const probes = [
       {
@@ -1846,7 +1863,6 @@ describe("parseCfml, cfthread background-job side-effect hints", () => {
   // cfthread action="run" is the canonical CFML fire-and-forget pattern:
   // the parent request returns immediately while the spawned thread executes
   // concurrently. Closes the background-job matrix: Java (@Async /
-  // CompletableFuture), C# (Hangfire), Ruby (perform_later), Django (Celery).
 
   it("surfaces background-job note for tag-form cfthread action=\"run\"", () => {
     const source = `<cfcomponent>
@@ -1908,7 +1924,7 @@ describe("parseCfml, cfthread background-job side-effect hints", () => {
   // action="run"; a regex refactor that dropped `'` from the character
   // class would silently fail for Lucee/Adobe codebases using single-quoted
   // attribute values. Mirrors the per-alt-isolation idiom from the
-  // 5-parser side-effect-Notes sweep (java/csharp/ruby/django/cfml v7+).
+  // 5-parser side-effect-Notes sweep (java/unknown/ruby/django/cfml v7+).
   it("surfaces background-job note when action uses single quotes", () => {
     const forms = [
       {
@@ -1944,6 +1960,96 @@ describe("parseCfml, cfthread background-job side-effect hints", () => {
         `${label} with single-quoted action='run' should emit background-job note`,
       ).toContain("Enqueues background job (cfthread)");
     }
+  });
+});
+
+describe("parseCfml, ADR-008 edge cases", () => {
+  // ADR-008 documents the CFML parser as regex/scan (not a real AST) with two
+  // accepted risk areas: "deeply nested string interpolation" and "conditional
+  // <cffunction> inside <cfif>". Both currently work; the tests below pin the
+  // behaviour so a future regex tweak cannot silently regress them without
+  // someone noticing in CI.
+
+  it("detects every cffunction wrapped by <cfif>/<cfelse>, with its own side-effect note", () => {
+    // Two cffunctions, one in each branch of a <cfif>...<cfelse>. The parser
+    // is a simple "find <cffunction>, find matching </cffunction>" scan that
+    // never inspects the enclosing tag stack -- so cfif wrapping must not
+    // hide either function. Each function carries a distinct side-effect
+    // (cfmail vs cfquery) so we can prove the per-function hint extractor
+    // does NOT bleed notes across the cfif/cfelse boundary.
+    const source = `<cfcomponent>
+  <cfif application.mailEnabled>
+    <cffunction name="sendDigest">
+      <cfmail to="user@example.com" from="noreply@example.com" subject="Digest">Hi</cfmail>
+    </cffunction>
+  <cfelse>
+    <cffunction name="logSkip">
+      <cfquery name="rs">
+        insert into digest_skipped (id) values (1)
+      </cfquery>
+    </cffunction>
+  </cfif>
+</cfcomponent>`;
+    const candidates = parseCfml("/x/Conditional.cfc", "Conditional.cfc", source);
+    expect(candidates).toHaveLength(2);
+
+    const send = candidates.find((c) => c.name === "sendDigest");
+    const skip = candidates.find((c) => c.name === "logSkip");
+    expect(send, "sendDigest must be detected inside <cfif>").toBeDefined();
+    expect(skip, "logSkip must be detected inside <cfelse>").toBeDefined();
+
+    // Side effects partition cleanly: cfmail-only on the cfif branch,
+    // cfquery-only on the cfelse branch. A regression where notes bleed
+    // across functions would put "Sends email (cfmail)" on both.
+    const sendNotes = send!.hints.notes ?? [];
+    const skipNotes = skip!.hints.notes ?? [];
+    expect(sendNotes).toContain("Sends email (cfmail)");
+    expect(skipNotes.some((n) => n.startsWith("Sends email"))).toBe(false);
+
+    // The cfquery on the cfelse branch surfaces its table in databaseTables,
+    // not in notes (per the existing CFML hint extractor).
+    expect(skip!.hints.databaseTables ?? []).toContain("digest_skipped");
+    expect(send!.hints.databaseTables ?? []).not.toContain("digest_skipped");
+  });
+
+  it("handles deeply nested #...# interpolation inside cfmail and cfquery without false positives or dropped notes", () => {
+    // Pathological interpolation: a `#...#` ColdFusion-expression containing
+    // a quoted bracket subscript whose key is itself a `#...#` expansion
+    // (e.g. `#application.cfg["#variables.tenant#"].email#`). This is the
+    // exact shape ADR-008 calls out as edge-case risky for a regex scanner;
+    // the tag-attribute parser must not get confused into ending the cfmail
+    // tag early, and the cfquery body table extractor must not split on
+    // one of the embedded `#` markers.
+    const source = `<cfcomponent>
+  <cffunction name="sendLocalized">
+    <cfmail to="#application.cfg["#variables.tenant#"].email#" from="#variables.from#" subject="Welcome">
+      Hello #arguments.user#, your code is #application.cfg["#variables.tenant#"].code#.
+    </cfmail>
+    <cfquery name="audit">
+      insert into audit_log (msg) values ('#application.cfg["#variables.tenant#"].slug#')
+    </cfquery>
+  </cffunction>
+</cfcomponent>`;
+    const candidates = parseCfml("/x/Nested.cfc", "Nested.cfc", source);
+    expect(candidates).toHaveLength(1);
+
+    const c = candidates[0]!;
+    expect(c.name).toBe("sendLocalized");
+
+    // Both side effects must be detected exactly once; the nested `#` must
+    // not produce phantom duplicates and must not mask either real signal.
+    const notes = c.hints.notes ?? [];
+    const emailNotes = notes.filter((n) => n === "Sends email (cfmail)");
+    expect(emailNotes).toHaveLength(1);
+
+    // The cfquery's INSERT INTO target must survive the embedded `#`
+    // interpolation in the VALUES clause; `audit_log` is the only table.
+    const tables = c.hints.databaseTables ?? [];
+    expect(tables).toContain("audit_log");
+    // Defends against a future regex that latched onto `variables` or
+    // `application` (CFML scope tokens nested inside the interpolation).
+    expect(tables).not.toContain("variables");
+    expect(tables).not.toContain("application");
   });
 });
 

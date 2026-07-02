@@ -79,11 +79,30 @@ function parseBeforeAction(trimmed: string): BeforeAction | null {
   return { callback, only, except };
 }
 
-/** Return true when the given before_action applies to the named action. */
+/** Return true when the given before_action (or skip_before_action) applies to the named action. */
 function beforeActionApplies(ba: BeforeAction, actionName: string): boolean {
   if (ba.only !== null) return ba.only.has(actionName);
   if (ba.except !== null) return !ba.except.has(actionName);
   return true;
+}
+
+/**
+ * Parse a single `skip_before_action` / `skip_before_filter` line.
+ * Returns a BeforeAction-shaped record describing which actions the skip
+ * covers (same `only`/`except` semantics as before_action itself).
+ */
+function parseSkipBeforeAction(trimmed: string): BeforeAction | null {
+  const m = trimmed.match(
+    /^(?:skip_before_action|skip_before_filter)\s+:(\w+[?!]?)(.*)/,
+  );
+  if (!m) return null;
+  const callback = m[1]!;
+  const rest = m[2] ?? "";
+  const onlyMatch = rest.match(/\bonly:\s*(%[iI]\[[^\]]*\]|\[[^\]]*\])/);
+  const exceptMatch = rest.match(/\bexcept:\s*(%[iI]\[[^\]]*\]|\[[^\]]*\])/);
+  const only = onlyMatch ? new Set(parseSymbolList(onlyMatch[1]!)) : null;
+  const except = exceptMatch ? new Set(parseSymbolList(exceptMatch[1]!)) : null;
+  return { callback, only, except };
 }
 
 // ActiveRecord class-level methods used to query or persist model data.
@@ -194,6 +213,7 @@ export function parseRuby(
   let inClass = false;
   let privateSection = false;
   const beforeActions: BeforeAction[] = [];
+  const skipBeforeActions: BeforeAction[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
@@ -210,12 +230,17 @@ export function parseRuby(
       continue;
     }
 
-    // ---- before_action / before_filter declarations -------------------
+    // ---- before_action / before_filter / skip_before_action declarations
     // Collect at immediate class-body depth (not inside methods).
     if (inClass && outerDepth === classDepth + 1) {
       const ba = parseBeforeAction(trimmed);
       if (ba) {
         beforeActions.push(ba);
+        continue;
+      }
+      const skip = parseSkipBeforeAction(trimmed);
+      if (skip) {
+        skipBeforeActions.push(skip);
         continue;
       }
     }
@@ -246,7 +271,7 @@ export function parseRuby(
         const lineStart = i + 1; // 1-indexed
 
         const { endIdx, methodSource } = extractMethodBody(lines, i);
-        const hints = buildHints(methodName, paramStr, className, beforeActions, methodSource);
+        const hints = buildHints(methodName, paramStr, className, beforeActions, skipBeforeActions, methodSource);
 
         candidates.push({
           language: "ruby",
@@ -386,6 +411,7 @@ function buildHints(
   paramStr: string,
   className: string,
   beforeActions: BeforeAction[] = [],
+  skipBeforeActions: BeforeAction[] = [],
   methodSource = "",
 ): CandidateHints {
   const hints: CandidateHints = {};
@@ -418,8 +444,12 @@ function buildHints(
 
   // Surface applicable before_action callbacks as auth notes so the LLM
   // can describe access control without reading the class body.
+  // Exclude callbacks that are cancelled by a matching skip_before_action.
   const applicableCallbacks = beforeActions
     .filter((ba) => beforeActionApplies(ba, methodName))
+    .filter((ba) => !skipBeforeActions.some(
+      (skip) => skip.callback === ba.callback && beforeActionApplies(skip, methodName),
+    ))
     .map((ba) => `:${ba.callback}`);
   if (applicableCallbacks.length > 0) {
     hints.notes = [`before_action: ${applicableCallbacks.join(", ")}`];
@@ -546,16 +576,20 @@ function buildHints(
     }
     // Filesystem mutations. Writing, deleting, moving, or creating files
     // affects shared disk state and is audit-relevant. Reads (File.read,
-    // File.readlines, File.foreach, File.exist?) are intentionally NOT
-    // flagged: no blast radius. Detects four families:
-    //   - File class mutators: write, delete, rename, truncate, unlink,
-    //     chmod, chown
+    // File.readlines, File.foreach, File.exist?, IO.read, IO.binread) are
+    // intentionally NOT flagged: no blast radius. Detects five families:
+    //   - File class mutators: write, binwrite, delete, rename, truncate,
+    //     unlink, chmod, chown
+    //   - IO one-shot writers: IO.write, IO.binwrite (the canonical short
+    //     forms equivalent to File.write / File.binwrite; reads IO.read /
+    //     IO.binread stay unflagged)
     //   - File.open with write or append mode (second arg starts with w/a)
     //   - FileUtils mutators: cp, cp_r, mv, rm, rm_f, rm_rf, mkdir, mkdir_p,
     //     touch, chmod, chown, ln, ln_s, remove
     //   - Dir mutators: mkdir, rmdir, delete, unlink
     if (
-      /\bFile\.(?:write|delete|rename|truncate|unlink|chmod|chown)\s*\(/.test(methodSource)
+      /\bFile\.(?:write|binwrite|delete|rename|truncate|unlink|chmod|chown)\s*\(/.test(methodSource)
+      || /\bIO\.(?:write|binwrite)\s*\(/.test(methodSource)
       || /\bFile\.open\s*\(\s*[^,)]+,\s*["'][wa]/.test(methodSource)
       || /\bFileUtils\.(?:cp|cp_r|mv|rm|rm_f|rm_rf|mkdir|mkdir_p|touch|chmod|chown|ln|ln_s|remove)\b/.test(methodSource)
       || /\bDir\.(?:mkdir|rmdir|delete|unlink)\s*\(/.test(methodSource)

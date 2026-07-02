@@ -6,7 +6,38 @@ import {
   bannerPlainText,
   buildConfluenceBanner,
   buildNotionBannerBlock,
+  stripFrontmatter,
 } from "./types.js";
+
+describe("stripFrontmatter", () => {
+  it("removes a leading YAML frontmatter block", () => {
+    const md = "---\ncode2wiki_id: x\ntitle: T\n---\n\n# Body\n\ntext";
+    expect(stripFrontmatter(md)).toBe("\n# Body\n\ntext");
+  });
+
+  it("leaves body-only markdown unchanged", () => {
+    const md = "## Summary\n\nA quick test.\n";
+    expect(stripFrontmatter(md)).toBe(md);
+  });
+
+  it("is non-greedy: never strips a `---` horizontal rule in the body", () => {
+    // Two `---` rules in the body must survive; only the leading
+    // frontmatter block (if any) is removed.
+    const md = "---\ntitle: T\n---\n\nIntro\n\n---\n\nMore\n\n---\n\nEnd";
+    expect(stripFrontmatter(md)).toBe("\nIntro\n\n---\n\nMore\n\n---\n\nEnd");
+  });
+
+  it("strips a CRLF-line-ending frontmatter block (Windows-edited page)", () => {
+    // `publish` reads .md files raw; a page saved with CRLF endings must not
+    // leak its YAML frontmatter onto the wiki as visible text.
+    const md =
+      "---\r\ncode2wiki_id: x\r\ntitle: T\r\n---\r\n## Summary\r\nbody\r\n";
+    const out = stripFrontmatter(md);
+    expect(out).toBe("## Summary\r\nbody\r\n");
+    expect(out).not.toContain("code2wiki_id");
+    expect(out).not.toContain("title: T");
+  });
+});
 
 // ---- resolveBannerInputs ---------------------------------------------------
 

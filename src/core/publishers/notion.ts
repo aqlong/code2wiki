@@ -7,6 +7,7 @@ import {
   type PublishMode,
   buildNotionBannerBlock,
   resolveBannerInputs,
+  stripFrontmatter,
 } from "./types.js";
 import {
   type Preflighter,
@@ -272,9 +273,9 @@ export function markdownToNotionBlocks(markdown: string): unknown[] {
   return blocks;
 }
 
-/** Strip frontmatter from the markdown body. */
+/** Strip frontmatter from the markdown body (shared with Confluence). */
 function bodyMarkdown(page: PageInput): string {
-  return page.markdown.replace(/^---\n[\s\S]*?\n---\n/, "");
+  return stripFrontmatter(page.markdown);
 }
 
 /** Properties payload for create / update. */

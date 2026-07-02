@@ -177,6 +177,10 @@ export function validateUseCaseDraft(
     draft.business_rules?.map((r) => [r?.rule, r?.footnote].join(" ")).join(" "),
     draft.test_scenarios?.map((s) => [s?.label, s?.gwt].join(" ")).join(" "),
     draft.related?.map((r) => [r?.title].join(" ")).join(" "),
+    // tags render into the published page's YAML frontmatter (renderer.ts
+    // `tags: useCase.tags`), so an em dash slipped into a tag ships to the
+    // customer's wiki and violates the no-em-dash contract just like body text.
+    draft.tags?.join(" "),
     draft.confidence_reason,
   ]
     .filter((t) => typeof t === "string")
@@ -262,14 +266,39 @@ function hasContent(value: unknown): boolean {
  *
  * Exported for test access only (compliance-keywords-are-lowercase test).
  */
+/**
+ * Shared keyword set for the two database-transaction prefix variants below.
+ * (...)" while CFML emits "Executes database operations inside a transaction
+ * (cftransaction)". Both describe the SAME compliance category (atomic
+ * all-or-nothing writes), so they must surface on identical keywords. Holding
+ * one const referenced by both entries makes the parity the validator test
+ * pins ("Both arrays MUST stay in sync") structurally impossible to break,
+ * rather than catchable only after a hand-edit desyncs them.
+ */
+const TRANSACTION_KEYWORDS = [
+  "transaction",
+  "atomic",
+  "rollback",
+  "all-or-nothing",
+  "succeed or fail",
+  "all or nothing",
+];
+
 export const NOTE_KEYWORDS: Record<string, string[]> = {
   "Sends email": ["email", "mail", "notification", "notify", "inbox"],
   "Makes outbound HTTP request": ["http", "external service", "external api", "outbound", "api call", "third-party", "request to", "remote", "dependency", "upstream", "external", "calls an"],
   "Enqueues background job": ["background", "asynchronous", "async", "queue", "later", "deferred", "scheduled", "out of band", "trigger"],
   "Publishes Spring application event": ["event", "publish", "subscriber", "listener"],
-  "Sends message to broker": ["broker", "kafka", "rabbitmq", "rabbit", "jms", "amqp", "message queue", "topic"],
-  "Executes database operations inside a transaction": ["transaction", "atomic", "rollback", "all-or-nothing", "succeed or fail", "all or nothing"],
-  "Executes within a database transaction": ["transaction", "atomic", "rollback", "all-or-nothing", "succeed or fail", "all or nothing"],
+  // "Sends message to broker (MassTransit / Azure Service Bus)" variant
+  //. The 8 generic keywords above (broker/kafka/rabbit/...) do
+  // NOT substring-match an LLM rendering like "publishes to the Azure Service
+  // Bus via MassTransit", so without these two the validator falsely warns that
+  // the broker note was dropped. Both are distinct product names that only
+  // appear in broker contexts, so no cross-category false positive (and they're
+  // keyed to the "Sends message to broker" prefix anyway).
+  "Sends message to broker": ["broker", "kafka", "rabbitmq", "rabbit", "jms", "amqp", "message queue", "topic", "service bus", "masstransit"],
+  "Executes database operations inside a transaction": TRANSACTION_KEYWORDS,
+  "Executes within a database transaction": TRANSACTION_KEYWORDS,
   "Calls stored procedure": ["stored procedure", "stored-procedure", "sproc", "stored proc"],
   "Writes to file system": ["file", "disk", "filesystem", "upload", "saves", "persisted to", "writes to", "export", "log", "report", "download"],
   // All keywords MUST be lowercase: the haystack is `.toLowerCase()`'d at

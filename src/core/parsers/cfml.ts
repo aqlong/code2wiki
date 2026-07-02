@@ -521,6 +521,7 @@ function extractCfmlHints(
   const events = block.match(/announceEvent\s*\(\s*["']([^"']+)["']/gi) ?? [];
   if (events.length) {
     hints.notes = [
+      ...(hints.notes ?? []),
       `Fires plugin events: ${events
         .map((e) => e.match(/["']([^"']+)["']/)?.[1])
         .filter(Boolean)

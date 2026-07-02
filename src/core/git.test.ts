@@ -31,10 +31,10 @@ describe("changedFilesSince", () => {
     await commit(repo, "a.txt", "alpha\n", "initial");
     await commit(repo, "b.txt", "beta\n", "add b");
     await commit(repo, "a.txt", "alpha v2\n", "update a");
-  }, 30000);
+  }, 60000);
   afterAll(async () => {
     if (repo) await fs.rm(repo, { recursive: true, force: true });
-  }, 30000);
+  }, 60000);
 
   it("returns files changed between a ref and HEAD", async () => {
     const changed = await changedFilesSince(repo, "HEAD~1");
@@ -49,6 +49,22 @@ describe("changedFilesSince", () => {
   it("returns null when the ref is invalid (caller falls back to full regen)", async () => {
     const changed = await changedFilesSince(repo, "no-such-ref");
     expect(changed).toBeNull();
+  });
+
+  // A ref carrying shell metacharacters must reach git as ONE literal
+  // argument, never interpreted by a shell. Under the old exec(`git diff ...
+  // ${ref} HEAD`) form this string would break out and run `touch INJECTED`
+  // in the repo. With execFile the whole thing is a single ref git rejects,
+  // so we get null AND no side-effect file. Pinned so a refactor back to a
+  // shell-string interpolation regresses here.
+  it("treats a shell-metacharacter ref as a literal ref (no command execution)", async () => {
+    const changed = await changedFilesSince(repo, "HEAD; touch INJECTED.txt");
+    expect(changed).toBeNull();
+    const injected = await fs
+      .stat(path.join(repo, "INJECTED.txt"))
+      .then(() => true)
+      .catch(() => false);
+    expect(injected).toBe(false);
   });
 
   it("currentCommit returns a non-empty short SHA", async () => {
@@ -88,10 +104,10 @@ describe("changedFilesSince: uncommitted (working-tree) ref", () => {
     repo = await makeRepo();
     await commit(repo, "tracked.txt", "v1\n", "initial tracked");
     await commit(repo, "to-delete.txt", "doomed\n", "add to-delete");
-  }, 30000);
+  }, 60000);
   afterAll(async () => {
     if (repo) await fs.rm(repo, { recursive: true, force: true });
-  }, 30000);
+  }, 60000);
 
   it("returns [] on a clean working tree (no uncommitted changes)", async () => {
     const changed = await changedFilesSince(repo, "uncommitted");

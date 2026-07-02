@@ -212,7 +212,7 @@ export async function runReplay(opts: ReplayOptions): Promise<ReplayReport> {
 
   // One scan of the project up front; the candidate list is reused
   // across all audit entries.
-  const candidates = await scanProject(opts.cwd, config);
+  let candidates = await scanProject(opts.cwd, config);
   const projectName = path.basename(opts.cwd);
   const commit = await currentCommit(opts.cwd);
   const generatedAt = (opts.now ?? (() => new Date().toISOString()))();

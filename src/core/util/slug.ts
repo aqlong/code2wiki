@@ -31,5 +31,13 @@ export function stableId(language: string, relativePath: string, name: string): 
     .toLowerCase()
     .replace(/^-+|-+$/g, "");
   const fn = slugify(name);
-  return `${language}-${path}-${fn}-v1`;
+  // Collapse any dash run in the assembled id. `path` or `fn` can be empty
+  // (a file literally named ".cfc" sanitizes its stem to "", and a name with
+  // no ASCII-alphanumerics slugifies to ""); an empty component at a join
+  // boundary would otherwise emit the exact "--v1"/"--" double dash the
+  // slugify 80-char-cap fix already guards against on the slug side, and the
+  // same failure follows (a publisher fails the upsert or creates a
+  // duplicate page). This is a no-op for every well-formed id, none contain
+  // a dash run, so existing upsert keys never rotate.
+  return `${language}-${path}-${fn}-v1`.replace(/-{2,}/g, "-");
 }

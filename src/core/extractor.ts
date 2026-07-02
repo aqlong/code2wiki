@@ -155,12 +155,19 @@ export async function extractUseCase(
       ? llmResult.title
       : humanizeName(candidate.name);
 
-  const slug = slugify(title);
   const code2wiki_id = stableId(
     candidate.language,
     candidate.relativePath,
     candidate.name,
   );
+  // slugify(title) is empty when the title has no ASCII-alphanumeric
+  // characters, e.g. a use-case title the LLM writes entirely in a
+  // non-Latin script. An empty slug yields a broken page URL and makes
+  // every such page collide on the same empty URL form, so fall back to
+  // the humanized method name, then to the always-non-empty code2wiki_id
+  // (its `<language>-...` prefix guarantees a sluggable char).
+  const slug =
+    slugify(title) || slugify(humanizeName(candidate.name)) || code2wiki_id;
 
   const useCase: UseCase = {
     code2wiki_id,
@@ -203,121 +210,3 @@ function humanizeName(name: string): string {
     .replace(/^./, (c) => c.toUpperCase());
 }
 
-// ---------------------------------------------------------------------------
-// .aspx / .ascx / .asax markup + code-behind pairing (ADR-040 D4)
-// ---------------------------------------------------------------------------
-//
-// ASP.NET WebForms splits one logical page across two files: the .aspx
-// markup (handler references in attributes, inline server tags) and the
-// .aspx.cs code-behind (event-handler method bodies). The parsers emit
-// one Candidate per file independently; this step pairs them so the LLM
-// receives both halves as one input via the `companionSources` field.
-//
-// Per the planning note, pairing lives at the orchestration layer (D4
-// option c) rather than inside parseFile so per-file parsers stay simple.
-// Run after every per-file parseFile() call has completed and before the
-// LLM-call phase.
-
-/**
- * Derive a pairing key from a relative file path. Two paths share a key
- * if they describe the same logical WebForms page:
- *
- *   "Web/Default.aspx"     -> "Web/Default"
- *   "Web/Default.aspx.cs"  -> "Web/Default"   (strip the dual extension)
- *   "Controls/Menu.ascx"   -> "Controls/Menu"
- *   "Controls/Menu.ascx.cs"-> "Controls/Menu"
- *   "Global.asax"          -> "Global"
- *   "Global.asax.cs"       -> "Global"
- *
- * Everything else (plain `.cs`, `.java`, `.cfm`, `.vb`, etc.) returns null
- * so non-WebForms candidates pass through untouched. The .vb branch is
- * intentional: VB.NET code-behind sits outside the v1 scope per ADR-040,
- * and a null key is the natural pass-through.
- *
- * Exported for unit testing the key logic independently of the pairer.
- */
-export function aspxPairingKey(relativePath: string): string | null {
-  // Match `.aspx.cs` / `.ascx.cs` / `.asax.cs` first (more specific).
-  const dualMatch = relativePath.match(/^(.+)\.(aspx|ascx|asax)\.cs$/);
-  if (dualMatch) return dualMatch[1];
-  // Match a bare `.aspx` / `.ascx` / `.asax` page.
-  const markupMatch = relativePath.match(/^(.+)\.(aspx|ascx|asax)$/);
-  if (markupMatch) return markupMatch[1];
-  return null;
-}
-
-/**
- * Pair every `kind:"aspx-page"` candidate with the raw source text of its
- * sibling code-behind file(s). Candidates whose relative path doesn't yield
- * a pairing key (Java, CFML, Ruby, Python, plain `.cs`, `.vb`, etc.) pass
- * through unchanged. aspx candidates with no matching code-behind also pass
- * through unchanged (companionSources stays undefined).
- *
- * The function takes a raw-source lookup keyed by relative path. Callers
- * that already have file contents in memory pass a populated Map; tests
- * pass a synthetic Map without disk I/O. The pairer never reads files
- * itself; that's the caller's job.
- *
- * Multiple code-behind candidates from one .aspx.cs (e.g. several
- * webforms-handler methods on the same file) collapse into one
- * companionSources entry because the entry is keyed by file path, not by
- * candidate.
- */
-export function pairAspxCandidates(
-  candidates: Candidate[],
-  fileSources?: Map<string, string>,
-): Candidate[] {
-  // Group candidates by pairing key:
-  //   group.aspx           the aspx-page Candidate (at most one per key)
-  //   group.codeBehindPaths the relativePaths of all paired code-behind
-  //                         candidates (deduplicated)
-  type Group = { aspx?: Candidate; codeBehindPaths: Set<string> };
-  const groups = new Map<string, Group>();
-  for (const c of candidates) {
-    const key = aspxPairingKey(c.relativePath);
-    if (key === null) continue;
-    let group = groups.get(key);
-    if (!group) {
-      group = { codeBehindPaths: new Set<string>() };
-      groups.set(key, group);
-    }
-    if (c.kind === "aspx-page") {
-      group.aspx = c;
-    } else {
-      group.codeBehindPaths.add(c.relativePath);
-    }
-  }
-
-  // Build the per-candidate companionSources attachment. Only aspx-page
-  // candidates with at least one resolvable code-behind file get a non-empty
-  // array. Files we can't resolve (fileSources lookup returns undefined)
-  // are skipped silently; the orchestrator's earlier file-read step is
-  // responsible for surfacing read errors.
-  //
-  // Fallback path: when the user's config only includes *.aspx (not *.cs),
-  // no webforms-handler candidates exist and codeBehindPaths is empty. In
-  // that case we use the companionFile hint the aspx parser already set,
-  // provided the caller pre-loaded that file into fileSources.
-  const companions = new Map<Candidate, Array<{ path: string; content: string }>>();
-  for (const group of groups.values()) {
-    if (!group.aspx) continue;
-    const sources: Array<{ path: string; content: string }> = [];
-    for (const p of group.codeBehindPaths) {
-      const content = fileSources?.get(p);
-      if (content !== undefined) sources.push({ path: p, content });
-    }
-    if (sources.length === 0 && group.aspx.companionFile) {
-      const content = fileSources?.get(group.aspx.companionFile);
-      if (content !== undefined) sources.push({ path: group.aspx.companionFile, content });
-    }
-    if (sources.length > 0) companions.set(group.aspx, sources);
-  }
-
-  // Return a new list. Untouched candidates are returned by identity;
-  // paired aspx candidates get a shallow clone with companionSources set.
-  return candidates.map((c) => {
-    const cs = companions.get(c);
-    if (!cs) return c;
-    return { ...c, companionSources: cs };
-  });
-}

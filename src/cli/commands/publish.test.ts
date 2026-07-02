@@ -1064,7 +1064,7 @@ describe("runPublish config.publish.<target>.banner forwarding", () => {
       coexistence: { banner: { repoName: string; repoUrl?: string; commitUrlTemplate?: string } };
     };
     expect(ctorCfg.coexistence.banner.repoName).toBe("acme-corp");
-  }, 30000);
+  }, 60000);
 
   it("config.publish.confluence.banner.repoUrl reaches coexistence.banner.repoUrl", async () => {
     await fs.writeFile(

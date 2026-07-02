@@ -41,6 +41,14 @@ export async function parseFile(
       return parseRuby(filePath, relativePath, source);
     case ".py":
       return parseDjango(filePath, relativePath, source);
+    case ".cs":
+      return [];
+    case ".cshtml":
+    case ".vbhtml":
+      console.warn(
+        `[code2wiki] ${ext} files are not yet supported (file: ${relativePath}). No candidates produced.`,
+      );
+      return [];
     default:
       return [];
   }

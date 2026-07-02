@@ -89,6 +89,30 @@ describe("stableId", () => {
     );
   });
 
+  // Regression guards for the OTHER two paths to the "--v1"/"--" double
+  // dash the slugify 80-char fix only half-closed. slugify trimmed the fn's
+  // own trailing dash, but an empty fn (name with no ASCII-alphanumerics) or
+  // an empty path (a file whose stem sanitizes away, e.g. ".cfc") still left
+  // an empty component at a join boundary -> a double dash on the upsert key,
+  // which a publisher either fails to upsert or duplicates a page on.
+  it("collapses the double dash when the name slugifies to empty", () => {
+    const id = stableId("cfml", "src/Foo.cfc", "!!!");
+    expect(id).not.toMatch(/--/);
+    expect(id).toBe("cfml-src-foo-v1");
+  });
+
+  it("collapses the double dash when the path stem sanitizes to empty", () => {
+    const id = stableId("cfml", ".cfc", "doThing");
+    expect(id).not.toMatch(/--/);
+    expect(id).toBe("cfml-dothing-v1");
+  });
+
+  it("collapses triple dashes when both path stem and name slugify to empty", () => {
+    const id = stableId("cfml", ".cfc", "!!!");
+    expect(id).not.toMatch(/--/);
+    expect(id).toBe("cfml-v1");
+  });
+
   it("produces the exact canonical id for a CFML .cfc candidate", () => {
     // Exercises the CFML extension (.cfc) and an underscore_case name,
     // confirming the path sanitizer and the slug for underscored names

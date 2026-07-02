@@ -85,6 +85,32 @@ export function extractOutsideManagedRegion(text: string): {
   };
 }
 
+/**
+ * Strip a leading YAML frontmatter block (`---\n…\n---\n`) from rendered
+ * Markdown before it reaches a publisher's renderer.
+ *
+ * Generated `.md` files on disk carry frontmatter (`code2wiki_id`, `title`,
+ * `slug`, `tags`, `confidence`), and the `publish` command hands the whole
+ * file (frontmatter included) to the publisher as `page.markdown`. marked
+ * has no concept of YAML frontmatter, so without this strip those keys
+ * render as a visible heading/paragraph at the top of every published page.
+ *
+ * The regex is anchored at the start of the string and non-greedy, so it
+ * removes ONLY the leading frontmatter block, never a `---` horizontal rule
+ * later in the body. If there is no frontmatter the input passes through
+ * unchanged. Single source of truth so the Confluence and Notion publishers
+ * can never diverge on frontmatter handling (they did: Notion stripped,
+ * Confluence did not, leaking frontmatter onto every Confluence page).
+ */
+export function stripFrontmatter(markdown: string): string {
+  // Tolerate CRLF as well as LF: `publish` reads generated `.md` files raw
+  // from disk (publish.ts), and a page hand-edited in a Windows/CRLF editor
+  // would otherwise slip the whole YAML block (code2wiki_id / title /
+  // confidence) past this strip and render it as visible text on the wiki
+  // page, the same compliance leak the LF path closed.
+  return markdown.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+}
+
 // ---- ADR-016: wiki coexistence ------------------------------------------
 
 /** Three explicit publish modes. See docs/wiki-coexistence.md §3.4. */

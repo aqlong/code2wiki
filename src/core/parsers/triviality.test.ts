@@ -35,6 +35,16 @@ describe("isConstantReturnOnly, CFML script-style", () => {
       expected: true,
     },
     {
+      name: "return 0.0; (decimal placeholder)",
+      src: `function getRate() { return 0.0; }`,
+      expected: true,
+    },
+    {
+      name: "return -3.14; (negative decimal)",
+      src: `function offset() { return -3.14; }`,
+      expected: true,
+    },
+    {
       name: 'return "id";',
       src: `function name() { return "id"; }`,
       expected: true,
@@ -229,6 +239,23 @@ describe("isConstantReturnOnly, regex-flag + alias coverage", () => {
     // these as trivial. This test pins the current contract; flipping
     // it requires a deliberate edit + a comment-update on this test.
     expect(isConstantReturnOnly(`function f() { return +1; }`)).toBe(false);
+  });
+
+  it("drops `<cfreturn 0.0>` (decimal literal, tag-style)", () => {
+    // Companion to the script-style decimal cases: the shared LITERAL_RE
+    // decimal tail (`-?\d+(?:\.\d+)?` at triviality.ts) must also fire on
+    // the CFML <cfreturn> path so a tag-style decimal stub is filtered.
+    const src = `<cffunction name="r">\n  <cfreturn 0.0>\n</cffunction>`;
+    expect(isConstantReturnOnly(src)).toBe(true);
+  });
+
+  it("keeps a body that USES a decimal in real logic (not a bare return)", () => {
+    // Guards over-broadening: the decimal tail only matters as the WHOLE
+    // return value. A method computing with a decimal still has real
+    // logic and must be kept (the anchored `^return LITERAL;$` never
+    // matches `return x * 2.0;`).
+    const src = `function f() { var x = compute(); return x * 2.0; }`;
+    expect(isConstantReturnOnly(src)).toBe(false);
   });
 
   it("keeps body with code between two block comments (lazy `*?`)", () => {

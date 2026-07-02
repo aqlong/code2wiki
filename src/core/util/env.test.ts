@@ -93,6 +93,24 @@ describe("loadEnvFile", () => {
     expect(process.env["C2W_ENV_TEST_A"]).toBe("val # not a comment");
   });
 
+  it("strips a trailing inline comment after a double-quoted value", () => {
+    const file = tmpEnvFile('C2W_ENV_TEST_A="secret" # my token\n');
+    loadEnvFile(file);
+    expect(process.env["C2W_ENV_TEST_A"]).toBe("secret");
+  });
+
+  it("strips a trailing inline comment after a single-quoted value", () => {
+    const file = tmpEnvFile("C2W_ENV_TEST_A='secret' # my token\n");
+    loadEnvFile(file);
+    expect(process.env["C2W_ENV_TEST_A"]).toBe("secret");
+  });
+
+  it("leaves a lone unterminated opening quote intact (malformed input)", () => {
+    const file = tmpEnvFile('C2W_ENV_TEST_A="unterminated\n');
+    loadEnvFile(file);
+    expect(process.env["C2W_ENV_TEST_A"]).toBe('"unterminated');
+  });
+
   it("ignores blank lines and full-line comments", () => {
     const file = tmpEnvFile(
       [

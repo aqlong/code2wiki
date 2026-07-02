@@ -24,7 +24,10 @@ import type { Candidate } from "../types.js";
 // `true` doesn't get partially-matched by something more permissive.
 //
 // - Booleans, null, and CFML's `yes`/`no` aliases (case-insensitive).
-// - Integers, with optional leading sign.
+// - Numbers: integers or decimals, with an optional leading `-`.
+//   A constant decimal stub (`return 0.0;`, `<cfreturn 1.5>`) is just as
+//   much a placeholder as a constant integer, so the decimal tail is
+//   optional rather than a separate alternative.
 // - Single- OR double-quoted string with no embedded quote characters.
 //   String-with-escapes is intentionally NOT matched: it usually
 //   carries meaningful copy that a doc would want to surface (URLs,
@@ -33,7 +36,7 @@ import type { Candidate } from "../types.js";
 //   would carry real data and are kept.
 const LITERAL_RE = String.raw`(?:` +
   String.raw`true|false|null|yes|no` +
-  String.raw`|-?\d+` +
+  String.raw`|-?\d+(?:\.\d+)?` +
   String.raw`|"[^"\\]*"|'[^'\\]*'` +
   String.raw`|\{\s*\}|\[\s*\]` +
   String.raw`)`;

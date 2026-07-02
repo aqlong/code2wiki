@@ -68,6 +68,92 @@ const HTTP_VERB_METHODS: Record<string, string> = {
   options: "OPTIONS",
 };
 
+// Auth mixins that apply login/permission requirements to all methods in a CBV.
+// Keys are unqualified class names; values are the auth note strings emitted,
+// matching the @login_required / @permission_required FBV decorator patterns.
+const DJANGO_AUTH_MIXINS: Record<string, string> = {
+  LoginRequiredMixin: "auth: login_required",
+  PermissionRequiredMixin: "auth: permission_required",
+  UserPassesTestMixin: "auth: user_passes_test",
+};
+
+function extractMixinAuthNotes(bases: string): string[] {
+  const notes: string[] = [];
+  for (const b of bases.split(",")) {
+    const name = b.trim().split(".").pop() ?? "";
+    const note = DJANGO_AUTH_MIXINS[name];
+    if (note) notes.push(note);
+  }
+  return notes;
+}
+
+// Return the depth-balanced substring inside the parens beginning at openIdx
+// (which must point at '('), or null if the parens never close. String
+// literals are not specially handled; a ')' inside a quoted arg would close
+// early, but auth-decorator arguments (perm strings, mixin/test names) don't
+// contain parens in practice, and the failure mode is a dropped note rather
+// than a wrong one.
+function extractBalancedParen(text: string, openIdx: number): string | null {
+  let depth = 0;
+  for (let k = openIdx; k < text.length; k++) {
+    const ch = text[k];
+    if (ch === "(") depth++;
+    else if (ch === ")") {
+      depth--;
+      if (depth === 0) return text.slice(openIdx + 1, k);
+    }
+  }
+  return null;
+}
+
+// First positional argument of a decorator arg list: everything up to the
+// first top-level comma. Nested () [] {} are skipped so a comma inside them
+// (e.g. permission_required('app.view', raise_exception=True)) doesn't split
+// the positional arg early.
+function firstTopLevelArg(args: string): string {
+  let depth = 0;
+  for (let k = 0; k < args.length; k++) {
+    const ch = args[k];
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}") depth--;
+    else if (ch === "," && depth === 0) return args.slice(0, k);
+  }
+  return args;
+}
+
+// Map a decorator expression (`login_required` or `permission_required('x')`)
+// to its `auth: ...` note, or null when the name is not an access decorator.
+function authNoteForDecoratorExpr(expr: string): string | null {
+  const m = expr.trim().match(/^(\w+)\s*(?:\(([\s\S]*)\))?\s*$/);
+  if (!m) return null;
+  const name = m[1]!;
+  if (!DJANGO_AUTH_DECORATORS.has(name)) return null;
+  return m[2] !== undefined ? `auth: ${name}(${m[2].trim()})` : `auth: ${name}`;
+}
+
+// Django CBVs apply an FBV access decorator to the whole class (or one method)
+// via @method_decorator(login_required, name='dispatch'). @method_decorator is
+// not itself an access decorator, so unwrap each occurrence and surface the
+// wrapped (first positional) decorator as the auth note. Handles single-line
+// and multi-line forms; the block text is already bracket-balanced because the
+// caller bounds it via findDecoratorStart.
+function methodDecoratorAuthNotes(blockText: string): string[] {
+  const notes: string[] = [];
+  const marker = "@method_decorator(";
+  let from = 0;
+  for (;;) {
+    const at = blockText.indexOf(marker, from);
+    if (at === -1) break;
+    const openIdx = at + marker.length - 1; // points at '('
+    const inner = extractBalancedParen(blockText, openIdx);
+    if (inner === null) break;
+    from = openIdx + inner.length + 2; // past the matched ')'
+    const note = authNoteForDecoratorExpr(firstTopLevelArg(inner));
+    if (note) notes.push(note);
+  }
+  return notes;
+}
+
 // Known Django and DRF view base class names (unqualified, no module prefix).
 const DJANGO_VIEW_BASES = new Set([
   "View",
@@ -97,6 +183,7 @@ export function parseDjango(
   let className = "";
   let classPermissions: string[] = [];
   let classModels: string[] = [];
+  let classMixinAuthNotes: string[] = [];
 
   let i = 0;
   while (i < lines.length) {
@@ -113,6 +200,7 @@ export function parseDjango(
       inViewClass = false;
       classPermissions = [];
       classModels = [];
+      classMixinAuthNotes = [];
       // Fall through: process this line as module-level.
     }
 
@@ -131,6 +219,14 @@ export function parseDjango(
             className = name;
             classPermissions = [];
             classModels = [];
+            // Class-level auth comes from two sources: inherited auth mixins
+            // and @method_decorator(...) applied above the class declaration.
+            // Dedup so a class that both inherits LoginRequiredMixin and stacks
+            // @method_decorator(login_required) emits the note once.
+            classMixinAuthNotes = Array.from(new Set([
+              ...extractMixinAuthNotes(bases),
+              ...extractDecoratorNotes(lines, findDecoratorStart(lines, i), i),
+            ]));
           }
           i = sigEndIdx + 1;
           continue;
@@ -223,9 +319,17 @@ export function parseDjango(
 
           const httpVerb = HTTP_VERB_METHODS[name];
           const drfAction = DRF_ACTIONS[name];
+          const customAction = parseActionDecorator(lines, decoratorStart, i);
 
-          if (!name.startsWith("_") && (httpVerb !== undefined || drfAction !== undefined)) {
+          // Surface standard HTTP verb methods, DRF standard actions (list/create/...),
+          // and DRF custom @action methods. Non-decorated private/utility methods are skipped.
+          if (!name.startsWith("_") && (httpVerb !== undefined || drfAction !== undefined || customAction !== null)) {
             const authNotes = extractDecoratorNotes(lines, decoratorStart, i);
+            // For @action methods, build a route using the decorator's detail + methods
+            // and append the action method name to the path (DRF default url_name behaviour).
+            const effectiveDrfAction = drfAction ?? (customAction
+              ? { method: customAction.method, pathSuffix: `${customAction.pathSuffix}/${name}` }
+              : undefined);
             candidates.push({
               language: "python",
               filePath,
@@ -235,7 +339,7 @@ export function parseDjango(
               lineStart: decoratorStart + 1, // 1-indexed; includes leading decorators
               lineEnd: endIdx + 1,
               source: lines.slice(decoratorStart, endIdx + 1).join("\n"),
-              hints: buildCbvHints(name, params, className, httpVerb, drfAction, authNotes, classPermissions, classModels, lines.slice(decoratorStart, endIdx + 1).join("\n")),
+              hints: buildCbvHints(name, params, className, httpVerb, effectiveDrfAction, [...classMixinAuthNotes, ...authNotes], classPermissions, classModels, lines.slice(decoratorStart, endIdx + 1).join("\n")),
             });
           }
           i = endIdx + 1;
@@ -295,6 +399,57 @@ function isFbv(params: string): boolean {
   if (!first) return false;
   const name = first.replace(/^\*+/, "").split(/\s*[=:]\s*/)[0]?.trim() ?? "";
   return name === "request";
+}
+
+/**
+ * Scan the decorator block above a `def` for a DRF `@action(...)` decorator
+ * and parse its `detail` and `methods` arguments.
+ *
+ * Returns `{ method, pathSuffix }` in the same shape used by `DRF_ACTIONS` so
+ * `buildCbvHints` can treat custom actions identically to standard ones.
+ * Returns null when no `@action` decorator is present.
+ *
+ * Handles both single-line and multi-line decorator forms:
+ *   @action(detail=True, methods=["post"])
+ *   @action(
+ *       detail=False,
+ *       methods=["get", "post"],
+ *   )
+ *
+ * `url_path` overrides are intentionally ignored; the `name` used in the
+ * path is the action method name (matches DRF's default behaviour).
+ */
+function parseActionDecorator(
+  lines: string[],
+  decoratorStart: number,
+  defIdx: number,
+): { method: string; pathSuffix: string } | null {
+  const decoratorText = lines.slice(decoratorStart, defIdx).join("\n");
+  if (!/\@action\s*\(/.test(decoratorText)) return null;
+
+  // Match @action(...) including multi-line forms. The decorator block was
+  // already collected by findDecoratorStart so bracket balance is guaranteed.
+  const actionMatch = decoratorText.match(/@action\s*\(([\s\S]*?)\)/);
+  if (!actionMatch) return null;
+  const args = actionMatch[1] ?? "";
+
+  // detail=True means the route includes the resource pk, detail=False does not.
+  const detailMatch = args.match(/\bdetail\s*=\s*(True|False)/);
+  const detail = detailMatch ? detailMatch[1] === "True" : false;
+
+  // methods=['post'] or methods=["get", "post"] -- first entry is the primary verb.
+  const methodsMatch = args.match(/\bmethods\s*=\s*\[([^\]]*)\]/);
+  let method = "GET";
+  if (methodsMatch) {
+    const first = methodsMatch[1]!.split(",")[0]?.trim().replace(/['"]/g, "").toUpperCase();
+    if (first) method = first;
+  }
+
+  // path suffix: detail actions nest under /:id/<name>, list actions under /<name>.
+  // The action method name is appended by the caller (not here) so pathSuffix only
+  // contains the optional /:id segment.
+  const pathSuffix = detail ? "/:id" : "";
+  return { method, pathSuffix };
 }
 
 /**
@@ -469,6 +624,10 @@ function extractDecoratorNotes(
       notes.push(`auth: ${name}`);
     }
   }
+  // Unwrap @method_decorator(<access decorator>, name='dispatch') forms, which
+  // the per-line scan above skips (the head name is method_decorator, not an
+  // access decorator). Additive: no overlap with the direct-decorator notes.
+  notes.push(...methodDecoratorAuthNotes(lines.slice(fromIdx, toIdx).join("\n")));
   return notes;
 }
 
@@ -624,14 +783,16 @@ function extractSideEffectNotes(source: string): string[] {
   // mode arg, open(path, "r"), Path.read_text, os.stat, os.listdir) are
   // intentionally NOT flagged: no blast radius. Detects five families:
   //   - Built-in open() with write/append/exclusive mode (w / a / x / w+ / a+
-  //     / wb / ab, optionally with + or b suffix)
+  //     / wb / ab, optionally with + or b suffix). The first argument may be a
+  //     computed path with one level of call nesting (the dominant upload idiom
+  //     open(os.path.join(MEDIA_ROOT, name), "w") / open(get_path(), "w")).
   //   - os module mutators: remove, unlink, rename, rmdir, makedirs, mkdir,
   //     replace, symlink, link, chmod, chown
   //   - shutil mutators: copy, copyfile, copytree, copy2, copymode, move, rmtree
   //   - pathlib write methods: .write_text(, .write_bytes(
   //   - Django storage backend: default_storage.save / .delete
   if (
-    /\bopen\s*\([^,)]+,\s*["'][wax][b+]*["']/.test(source)
+    /\bopen\s*\((?:[^()]|\([^()]*\))*,\s*["'][wax][b+]*["']/.test(source)
     || /\bos\.(?:remove|unlink|rename|rmdir|makedirs|mkdir|replace|symlink|link|chmod|chown)\s*\(/.test(source)
     || /\bshutil\.(?:copy|copyfile|copytree|copy2|copymode|move|rmtree)\s*\(/.test(source)
     || /\.write_text\s*\(/.test(source)

@@ -9,6 +9,7 @@ import {
   buildConfluenceBanner,
   resolveBannerInputs,
   extractOutsideManagedRegion,
+  stripFrontmatter,
   FENCE_OPEN_PREFIX,
   FENCE_CLOSE,
 } from "./types.js";
@@ -216,7 +217,10 @@ function buildStorageWithBanner(
   const banner = buildConfluenceBanner(
     resolveBannerInputs(cfg.coexistence, resolveDefaults),
   );
-  const body = markdownToConfluenceStorage(page.markdown);
+  // Strip leading YAML frontmatter so its keys don't render as visible body
+  // text. Mirrors the Notion publisher's bodyMarkdown(); both share
+  // stripFrontmatter() so the two paths can't diverge again.
+  const body = markdownToConfluenceStorage(stripFrontmatter(page.markdown));
   return `${banner}\n${body}`;
 }
 

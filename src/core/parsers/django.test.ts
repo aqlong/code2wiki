@@ -417,6 +417,110 @@ class XMLPostViewSet(ModelViewSet):
   });
 });
 
+// ---- DRF @action decorator -----------------------------------------------
+
+describe("parseDjango: DRF @action custom actions", () => {
+  it("surfaces a detail @action as a POST to /:resource/:id/<name>", () => {
+    const source = `
+from rest_framework.viewsets import ModelViewSet
+from rest_framework.decorators import action
+
+class PostViewSet(ModelViewSet):
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        pass
+`;
+    const cs = candidates(source);
+    const c = cs.find((c) => c.name === "PostViewSet#publish");
+    expect(c).toBeDefined();
+    expect(c!.hints.httpRoute?.method).toBe("POST");
+    expect(c!.hints.httpRoute?.path).toContain(":id");
+    expect(c!.hints.httpRoute?.path).toContain("publish");
+  });
+
+  it("surfaces a list @action as a GET to /:resource/<name>", () => {
+    const source = `
+from rest_framework.viewsets import ModelViewSet
+from rest_framework.decorators import action
+
+class UserViewSet(ModelViewSet):
+    @action(detail=False, methods=["get"])
+    def me(self, request):
+        return Response({"id": request.user.id})
+`;
+    const cs = candidates(source);
+    const c = cs.find((c) => c.name === "UserViewSet#me");
+    expect(c).toBeDefined();
+    expect(c!.hints.httpRoute?.method).toBe("GET");
+    expect(c!.hints.httpRoute?.path).not.toContain(":id");
+    expect(c!.hints.httpRoute?.path).toContain("me");
+  });
+
+  it("picks the first method from a multi-method @action", () => {
+    const source = `
+from rest_framework.viewsets import ModelViewSet
+from rest_framework.decorators import action
+
+class ItemViewSet(ModelViewSet):
+    @action(detail=True, methods=["put", "patch"])
+    def approve(self, request, pk=None):
+        pass
+`;
+    const cs = candidates(source);
+    const c = cs.find((c) => c.name === "ItemViewSet#approve")!;
+    expect(c.hints.httpRoute?.method).toBe("PUT");
+  });
+
+  it("handles a multi-line @action decorator form", () => {
+    const source = `
+from rest_framework.viewsets import ModelViewSet
+from rest_framework.decorators import action
+
+class OrderViewSet(ModelViewSet):
+    @action(
+        detail=True,
+        methods=["post"],
+    )
+    def cancel(self, request, pk=None):
+        pass
+`;
+    const cs = candidates(source);
+    const c = cs.find((c) => c.name === "OrderViewSet#cancel");
+    expect(c).toBeDefined();
+    expect(c!.hints.httpRoute?.method).toBe("POST");
+    expect(c!.hints.httpRoute?.path).toContain(":id");
+    expect(c!.hints.httpRoute?.path).toContain("cancel");
+  });
+
+  it("does NOT surface custom methods without an @action decorator", () => {
+    const source = `
+from rest_framework.viewsets import ModelViewSet
+
+class UserViewSet(ModelViewSet):
+    def helper_method(self, request):
+        pass
+`;
+    const ns = names(source);
+    expect(ns).not.toContain("UserViewSet#helper_method");
+  });
+
+  it("propagates side-effect notes from @action method bodies", () => {
+    const source = `
+from rest_framework.viewsets import ModelViewSet
+from rest_framework.decorators import action
+
+class SubscriptionViewSet(ModelViewSet):
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        send_mail("Subscription activated", "...", from_email, [request.user.email])
+        return Response({"status": "active"})
+`;
+    const cs = candidates(source);
+    const c = cs.find((c) => c.name === "SubscriptionViewSet#activate")!;
+    expect(c.hints.notes).toContain("Sends email (Django mail)");
+  });
+});
+
 // ---- DRF APIView ---------------------------------------------------------
 
 describe("parseDjango: DRF APIView", () => {
@@ -1535,6 +1639,42 @@ def export_csv(request):
     expect(notes).toContain("Writes to file system");
   });
 
+  it("surfaces filesystem note for open() with a computed path argument", () => {
+    // The dominant Django upload idiom passes a built path, not a literal:
+    // open(os.path.join(MEDIA_ROOT, name), "w") / open(get_path(), "w").
+    // One level of call nesting inside the first arg must still be detected.
+    const cases = [
+      "open(os.path.join(MEDIA_ROOT, request.POST['name']), 'w')",
+      "open(get_upload_path(request), 'wb')",
+    ];
+    for (const call of cases) {
+      const source = `
+def save_upload(request):
+    f = ${call}
+    f.write(request.body)
+    return JsonResponse({'ok': True})
+`;
+      const cs = candidates(source);
+      const notes = cs[0]?.hints.notes ?? [];
+      expect(notes, `${call} should emit filesystem note`).toContain("Writes to file system");
+    }
+  });
+
+  it("does NOT surface filesystem note for open() with a computed path and no write mode", () => {
+    // Guard the relaxed first-arg regex: a nested call path with read (or no)
+    // mode must stay unflagged.
+    const source = `
+def load_upload(request):
+    f = open(os.path.join(MEDIA_ROOT, request.GET['name']), 'r')
+    contents = f.read()
+    g = open(get_upload_path(request))
+    return JsonResponse({'ok': True})
+`;
+    const cs = candidates(source);
+    const notes = cs[0]?.hints.notes ?? [];
+    expect(notes.some((n) => n === "Writes to file system")).toBe(false);
+  });
+
   it("surfaces filesystem note for os / shutil / pathlib / default_storage mutators", () => {
     const source = `
 def process(request):
@@ -1885,6 +2025,174 @@ def list_orders(request):
     const cs = candidates(source);
     const notes = cs[0]?.hints.notes ?? [];
     expect(notes.some((n) => n === "Calls stored procedure")).toBe(false);
+  });
+});
+
+describe("parseDjango: CBV auth mixin notes (LoginRequiredMixin etc.)", () => {
+  it("emits auth: login_required when class inherits LoginRequiredMixin", () => {
+    const source = `
+class PostDetailView(LoginRequiredMixin, DetailView):
+    model = Post
+    def get(self, request, pk):
+        post = Post.objects.get(pk=pk)
+        return render(request, 'post_detail.html', {'post': post})
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(1);
+    const notes = candidates[0].hints.notes;
+    expect(notes).toBeDefined();
+    expect(notes!.some((n) => n === "auth: login_required")).toBe(true);
+  });
+
+  it("emits auth: permission_required when class inherits PermissionRequiredMixin", () => {
+    const source = `
+class AdminDashboard(PermissionRequiredMixin, TemplateView):
+    permission_required = "myapp.can_view_dashboard"
+    def get(self, request):
+        return render(request, 'dashboard.html', {})
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].hints.notes!.some((n) => n === "auth: permission_required")).toBe(true);
+  });
+
+  it("emits auth: user_passes_test when class inherits UserPassesTestMixin", () => {
+    const source = `
+class StaffOnlyView(UserPassesTestMixin, View):
+    def test_func(self):
+        return self.request.user.is_staff
+    def get(self, request):
+        return render(request, 'staff.html', {})
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].hints.notes!.some((n) => n === "auth: user_passes_test")).toBe(true);
+  });
+
+  it("propagates mixin auth note to every method in the class", () => {
+    const source = `
+class SecureView(LoginRequiredMixin, View):
+    def get(self, request):
+        return render(request, 'secure.html', {})
+    def post(self, request):
+        return redirect('/')
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(2);
+    for (const c of candidates) {
+      expect(c.hints.notes!.some((n) => n === "auth: login_required")).toBe(true);
+    }
+  });
+
+  it("does not emit mixin auth note for a class with no auth mixin", () => {
+    const source = `
+class PublicView(View):
+    def get(self, request):
+        return render(request, 'public.html', {})
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(1);
+    const notes = candidates[0].hints.notes ?? [];
+    expect(notes.some((n) => n.startsWith("auth:"))).toBe(false);
+  });
+});
+
+describe("parseDjango: CBV auth via @method_decorator(...)", () => {
+  it("unwraps class-level @method_decorator(login_required, name='dispatch')", () => {
+    const source = `
+@method_decorator(login_required, name='dispatch')
+class DashboardView(TemplateView):
+    def get(self, request):
+        return render(request, 'dash.html', {})
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].hints.notes).toContain("auth: login_required");
+  });
+
+  it("propagates a class-level @method_decorator auth note to every method", () => {
+    const source = `
+@method_decorator(login_required, name='dispatch')
+class AccountView(View):
+    def get(self, request):
+        return render(request, 'account.html', {})
+    def post(self, request):
+        return redirect('/')
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(2);
+    for (const c of candidates) {
+      expect(c.hints.notes).toContain("auth: login_required");
+    }
+  });
+
+  it("preserves the wrapped decorator's argument (permission_required)", () => {
+    const source = `
+@method_decorator(permission_required('app.view_post'), name='dispatch')
+class PostView(DetailView):
+    def get(self, request, pk):
+        return render(request, 'post.html', {})
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].hints.notes).toContain(
+      "auth: permission_required('app.view_post')",
+    );
+  });
+
+  it("unwraps a multi-line class-level @method_decorator block", () => {
+    const source = `
+@method_decorator(
+    login_required,
+    name='dispatch',
+)
+class ReportView(TemplateView):
+    def get(self, request):
+        return render(request, 'report.html', {})
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].hints.notes).toContain("auth: login_required");
+  });
+
+  it("unwraps a method-level @method_decorator(login_required)", () => {
+    const source = `
+class UserView(View):
+    @method_decorator(login_required, name='dispatch')
+    def get(self, request):
+        return render(request, 'user.html', {})
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].hints.notes).toContain("auth: login_required");
+  });
+
+  it("dedups when a class both inherits the mixin and stacks @method_decorator", () => {
+    const source = `
+@method_decorator(login_required, name='dispatch')
+class AdminView(LoginRequiredMixin, View):
+    def get(self, request):
+        return render(request, 'admin.html', {})
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(1);
+    const loginNotes = (candidates[0].hints.notes ?? []).filter(
+      (n) => n === "auth: login_required",
+    );
+    expect(loginNotes).toHaveLength(1);
+  });
+
+  it("does not emit an auth note for a non-access @method_decorator (cache_page)", () => {
+    const source = `
+@method_decorator(cache_page(60 * 15), name='dispatch')
+class CachedView(TemplateView):
+    def get(self, request):
+        return render(request, 'cached.html', {})
+`;
+    const candidates = parseDjango(`/app/views.py`, `app/views.py`, source);
+    expect(candidates).toHaveLength(1);
+    const notes = candidates[0].hints.notes ?? [];
+    expect(notes.some((n) => n.startsWith("auth:"))).toBe(false);
   });
 });
 

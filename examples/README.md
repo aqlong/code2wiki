@@ -20,6 +20,8 @@ These examples serve three purposes:
 - [`spring-petclinic-owner-create/`](spring-petclinic-owner-create/) — Java/Spring controller, owner registration form
 - [`spring-petclinic-find-owners/`](spring-petclinic-find-owners/) — Java/Spring search-form controller
 - [`masacms-publish-site/`](masacms-publish-site/) — CFML tag-based, site deployment to production
+- [`django-blog-post-publish/`](django-blog-post-publish/) — Django CBVs + function-based view, blog post publish/edit/delete (ADR-037)
+- [`rails-post-create/`](rails-post-create/) — Ruby / Rails controller, Devise-authenticated post creation with ActionMailer side-effect (ADR-036)
 
 ## How to add a new example
 

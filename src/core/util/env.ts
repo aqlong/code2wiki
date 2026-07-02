@@ -41,18 +41,23 @@ export function loadEnvFile(filepath: string): { loaded: number; skipped: number
     }
     const key = match[1]!;
     let value = match[2] ?? "";
-    // Strip trailing inline comment (only if value isn't quoted)
-    if (!/^["']/.test(value)) {
+    const quote = value[0];
+    // lastIndexOf finds the closing quote: it matches the previous
+    // end-anchored strip when the quote is the final character, and it
+    // also handles a trailing inline comment after the value
+    // (`KEY="val" # note`), which the old quoted branch left intact.
+    const closeIdx =
+      quote === '"' || quote === "'" ? value.lastIndexOf(quote) : -1;
+    if (closeIdx > 0) {
+      // Properly quoted value. Strip the outer quotes; anything after the
+      // closing quote (whitespace, an inline comment) is not part of it.
+      value = value.slice(1, closeIdx);
+    } else {
+      // Unquoted (or a lone dangling quote): strip a trailing inline
+      // comment outside any quote, then surrounding whitespace.
       const hashIdx = value.indexOf(" #");
       if (hashIdx >= 0) value = value.slice(0, hashIdx);
-    }
-    value = value.trim();
-    // Strip surrounding quotes
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
+      value = value.trim();
     }
     // Overwrite empty/unset values; keep non-empty pre-existing values intact.
     if (!process.env[key]) {

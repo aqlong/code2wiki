@@ -34,6 +34,13 @@ export default defineConfig({
       "apps/**",
       "tools/ocean-bot/**",
     ],
-    testTimeout: 30000,
+    testTimeout: 60000,
+    // Match hookTimeout to testTimeout. 30 s was too tight under full-suite
+    // parallel load (52 workers): git.test.ts beforeAll hooks each commit
+    // 2-3x via git subprocesses (~39 s observed), and preview/publish test
+    // bodies hit 33-55 s. A timed-out test skips its afterEach env-var
+    // cleanup, contaminating the next test (the publish.test.ts
+    // "spy called 2 times" cascade shape). 60 s gives comfortable headroom.
+    hookTimeout: 60000,
   },
 });

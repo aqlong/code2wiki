@@ -1,5 +1,7 @@
 #!/usr/bin/env -S npx tsx
-// Regenerate baseline.snapshot.json for every examples/<name>/expected.md.
+// Regenerate baseline*.snapshot.json for every examples/<name>/expected*.md.
+// Covers the primary expected.md and any additional expected-<variant>.md files
+// (e.g. expected-edit-post.md, expected-delete-post.md in the Django example).
 // Run after intentional spec changes to a hand-curated example.
 import { computeMarkdownSnapshot } from "../src/core/feedback/snapshot.ts";
 import {
@@ -19,16 +21,24 @@ const dirs = readdirSync(examplesDir).filter((name) => {
 });
 
 let wrote = 0;
-for (const name of dirs) {
-  const expected = join(examplesDir, name, "expected.md");
-  if (!existsSync(expected)) continue;
-  const text = readFileSync(expected, "utf8");
-  const snap = computeMarkdownSnapshot(text);
-  const out = join(examplesDir, name, "baseline.snapshot.json");
-  writeFileSync(out, JSON.stringify(snap, null, 2) + "\n");
-  console.log(
-    `wrote ${out}  (${snap.sections.length} sections, body ${snap.bodyLineCount} lines)`,
+for (const dirName of dirs) {
+  const dirPath = join(examplesDir, dirName);
+  const expectedFiles = readdirSync(dirPath).filter((f) =>
+    /^expected.*\.md$/.test(f),
   );
-  wrote++;
+  for (const expectedFile of expectedFiles) {
+    const expectedPath = join(dirPath, expectedFile);
+    const baselineFile = expectedFile
+      .replace(/^expected/, "baseline")
+      .replace(/\.md$/, ".snapshot.json");
+    const baselinePath = join(dirPath, baselineFile);
+    const text = readFileSync(expectedPath, "utf8");
+    const snap = computeMarkdownSnapshot(text);
+    writeFileSync(baselinePath, JSON.stringify(snap, null, 2) + "\n");
+    console.log(
+      `wrote ${baselinePath}  (${snap.sections.length} sections, body ${snap.bodyLineCount} lines)`,
+    );
+    wrote++;
+  }
 }
 console.log(`\n${wrote} baseline(s) written.`);
