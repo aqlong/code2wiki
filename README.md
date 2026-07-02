@@ -2,7 +2,7 @@
 
 > Confluence and Notion pages that always match the code your engineers just shipped, written for the BAs, QA, support, and auditors who never read your repo.
 
-**Status:** Working CLI MVP. End-to-end pipeline operational against real legacy CFML and Java repositories. Hosted SaaS layer (auto-publish to Confluence / Notion) coming next.
+**Status:** Working CLI + hosted dashboard live in production. End-to-end pipeline operational against real legacy CFML and Java repositories; the hosted SaaS layer (GitHub App, auto-generate on push, in-app previews) is running with design-partner onboarding underway.
 
 > **For hosted-dashboard customers, start here: [docs/getting-started.md](docs/getting-started.md).** The README below is the OSS CLI documentation; the hosted product has a different workflow (GitHub App, Sync-now button, in-app credential connections).
 
@@ -34,6 +34,10 @@ Where competitors genuinely outperform code2wiki today: **Mintlify** has a more 
 
 ## Screenshots
 
+Local CLI preview (`code2wiki preview`): pages grouped by source folder with per-group counts, confidence badges, and timestamps rendered in the viewer's timezone:
+
+![code2wiki CLI preview index with grouped pages and confidence badges](docs/images/demo-cli-preview-index.png)
+
 Dashboard index showing recent runs, repo sync status, and the Getting Started guide:
 
 ![code2wiki dashboard index](docs/images/demo-index.png)
@@ -64,7 +68,7 @@ What one of those cards opens: a BA-readable Confluence-format use-case page gen
 
 ```bash
 # 1. Install dependencies and build
-git clone https://github.com/craftandship/code2wiki.git
+git clone https://github.com/aqlong/code2wiki.git
 cd code2wiki
 npm install
 npm run build
@@ -187,7 +191,7 @@ up existing pages. Add it once before your first publish.
 - `claim`: preflight blocks the publish on title collisions; you adopt each conflicting page with `code2wiki claim <page-id-or-url> --target=<x> --map-to=<id>`. The original content is preserved outside the managed fence.
 - `parallel`: never touches unlabeled pages; nests our docs under a `code2wiki/` parent (Confluence) or `Section: code2wiki` rich-text property (Notion).
 
-Configure per-target in `code2wiki.config.json` under `publish.<target>.{mode, slugPrefix, titlePrefix, parentPageId, banner}`, or override at runtime with `--mode=<x>`. Every published page gets a 📝 attribution banner. Preflight results land in `.code2wiki/preflight.json` so CI can inspect them. See [docs/wiki-coexistence.md](docs/wiki-coexistence.md) for the full design.
+Configure per-target in `code2wiki.config.json` under `publish.<target>.{mode, slugPrefix, titlePrefix, parentPageId, banner}`, or override at runtime with `--mode=<x>`. Every published page gets a 📝 attribution banner. Preflight results land in `.code2wiki/preflight.json` so CI can inspect them. The full design is written up in `docs/wiki-coexistence.md` in the private monorepo.
 
 ## Audit log (compliance-friendly)
 
@@ -210,36 +214,37 @@ becomes a tamper-evident record of every doc change tied to a commit.
 
 ## Auto-running on every commit
 
-Drop [`.github/workflows/code2wiki.yml`](.github/workflows/code2wiki.yml) into your project. On every push to `main`, it:
+Add a GitHub Actions workflow to your project that, on every push to `main`:
 
 1. Installs and builds code2wiki
-2. Runs `code2wiki generate` against your repo
+2. Runs `code2wiki generate` against your repo (set the `ANTHROPIC_API_KEY` secret, or leave it unset and the run falls through to `--mock` with clearly-marked draft pages)
 3. Commits any updated use-case docs back into `docs/use-cases/`
-4. (Future: pushes them to Confluence / Notion via OAuth)
 
-For mock mode (no API key required), the workflow falls through to `--mock` automatically and emits clearly-marked draft pages so the pipeline runs end-to-end in CI.
+Scope the workflow's `paths:` trigger to your application source directories and exclude the generated `docs/use-cases/` output, otherwise the commit-back step re-triggers the workflow in a loop. The reference implementation lives at `.github/workflows/code2wiki.yml` in the private monorepo; a copy-paste public template is planned.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────┐
 │  OSS CLI (this repo, MIT)                   │
-│  - Tree-sitter (Java) + scanner (CFML)      │
-│  - Anthropic SDK with prompt caching        │
+│  - Per-language parsers (tree-sitter +      │
+│    custom scanners; see the table above)    │
+│  - Multi-backend LLM client (Anthropic /    │
+│    Azure OpenAI / DeepSeek) + prompt cache  │
 │  - Deterministic mock for tests / no-key    │
 │  - Stable IDs + idempotent slugs            │
 └────────────────┬────────────────────────────┘
                  │ same engine
 ┌────────────────▼────────────────────────────┐
 │  Hosted SaaS (proprietary, separate repo)   │
-│  - GitHub/GitLab app, push-to-main webhook  │
+│  - GitHub App, push-to-main webhook         │
 │  - Diff-aware regen on changed files only   │
-│  - Confluence + Notion + GitHub Wiki sync   │
-│  - Signed audit log of every doc change     │
+│  - Confluence + Notion sync                 │
+│  - Hash-chained audit log of every change   │
 └─────────────────────────────────────────────┘
 ```
 
-Full design rationale in [`docs/architecture.md`](docs/architecture.md).
+Full design rationale lives in `docs/architecture.md` in the private monorepo.
 
 ## Worked examples
 
@@ -263,41 +268,38 @@ code2wiki/
 ├── package.json
 ├── tsconfig.json
 ├── vitest.config.ts
-├── docs/                        # strategy + product specs
-│   ├── vision.md
-│   ├── architecture.md
-│   ├── usecase-template.md
-│   ├── competitive-analysis.md
-│   ├── roadmap.md
-│   ├── pricing.md
-│   └── decisions.md             # ADR log
+├── docs/                        # getting-started guide (+ strategy, ADRs in the private monorepo)
 ├── src/
 │   ├── cli/                     # commander entry + commands
 │   ├── core/                    # extraction engine
-│   │   ├── parsers/             # Java (tree-sitter), CFML (scanner)
-│   │   ├── llm/                 # Anthropic client + prompts + mock
+│   │   ├── parsers/             # per-language parsers (tree-sitter + scanners)
+│   │   ├── llm/                 # multi-backend LLM client + prompts + mock
+│   │   ├── publishers/          # Confluence + Notion + preflight + fence helpers
+│   │   ├── feedback/            # draft validator (chain-of-correction)
 │   │   ├── extractor.ts         # candidate → UseCase
 │   │   ├── renderer.ts          # UseCase → Markdown
+│   │   ├── audit.ts             # hash-chained audit log
 │   │   ├── scan.ts              # walk project, run parsers
 │   │   ├── config.ts            # config schema (zod)
 │   │   ├── git.ts               # commit metadata helpers
 │   │   ├── types.ts             # shared types
-│   │   └── util/                # slug, lines
+│   │   └── util/                # slug, env, lines
 │   └── index.ts                 # library entry
 ├── examples/                    # gold-standard demos + regression fixtures
-├── references/                  # cloned demo codebases (gitignored)
-└── .github/workflows/           # CI + auto-regenerate
+├── tools/scripts/               # local verification toolbox
+└── references/                  # cloned demo codebases (gitignored)
 ```
 
 ## Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md). Status:
+The working roadmap lives in `docs/roadmap.md` in the private monorepo. Status:
 
 - ✅ **Week 1**, CFML + Java parser + first real-app demos + tests + CI
-- ✅ **Week 2**, Hosted dashboard at [`apps/dashboard/`](apps/dashboard/). Next.js 15 + Auth.js (GitHub OAuth) + Drizzle/Postgres + GitHub-App webhook handler + Octokit-driven worker (real `git clone --depth=1` against installation tokens) + run-trigger route + repo-list and audit-log dashboard surfaces + `railway.toml` deploy config. The operator step (provision Railway + register the GitHub App + paste credentials) is in [`apps/dashboard/SETUP.md`](apps/dashboard/SETUP.md). Stripe billing moved to Week 4 with design-partner onboarding.
+- ✅ **Week 2**, Hosted dashboard: Next.js 15 + Auth.js (GitHub OAuth) + Drizzle/Postgres + GitHub-App webhook handler + Octokit-driven worker (real `git clone --depth=1` against installation tokens) + run-trigger route + repo-list and audit-log dashboard surfaces. Live in production since 2026-05-08.
 - ✅ **Week 3**, Confluence + Notion publishers (CLI version)
+- ✅ **Stripe billing**, live in production since 2026-05-13 (self-serve Checkout + Billing Portal)
 - ⏳ **Week 4**, 5 warm-network design partners (ADR-016 coexistence prerequisite ✅ shipped)
-- ✅ **Week 6**, Diff-aware regen + hash-chained audit log
+- ✅ **Week 6**, Diff-aware regen + hash-chained audit log (+ opt-in Ed25519 signing)
 - ⏳ **Week 7**, Adobe ColdFusion forum + Ortus Solutions outreach
 - ⏳ **Week 8**, Public launch
 
@@ -311,7 +313,7 @@ npm test           # vitest
 npm run dev        # run CLI without building (tsx)
 ```
 
-Tests run without an LLM key (deterministic mock mode). Real LLM integration requires `ANTHROPIC_API_KEY` and respects 24-hour prompt caching to keep costs low.
+Tests run without an LLM key (deterministic mock mode). Real LLM integration requires a backend key (see LLM backends above); the Anthropic path uses prompt caching on the system prompt to keep costs low.
 
 ## CLI reference
 
