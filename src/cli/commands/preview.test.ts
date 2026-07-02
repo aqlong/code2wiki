@@ -620,13 +620,20 @@ The auth step delegates to the legacy checker. [^auth]
     expect(cfHtml).toMatch(/<time data-c2w-localize datetime="[^"]+"[^>]*>/);
     expect(ntHtml).toMatch(/<time data-c2w-localize datetime="[^"]+"[^>]*>/);
 
-    // The localize script appears on every surface. Pin a stable
-    // substring inside it so a refactor that renames the function but
-    // keeps behavior still passes.
     for (const html of [cfHtml, ntHtml, idxHtml]) {
+      // The localize script appears on every surface. Pin a stable
+      // substring inside it so a refactor that renames the function but
+      // keeps behavior still passes.
       expect(html).toContain("data-c2w-localize");
       expect(html).toContain("Intl.DateTimeFormat");
       expect(html).toContain("toLocaleString");
+      // Placement is load-bearing: the script must come AFTER the <time>
+      // elements it rewrites. A synchronous script in <head> runs before
+      // the body is parsed and silently rewrites nothing (live-buggy in
+      // the first local-time implementation).
+      expect(html.indexOf("Intl.DateTimeFormat")).toBeGreaterThan(
+        html.indexOf('<time data-c2w-localize'),
+      );
     }
 
     // Index "Generated" timestamp is also wrapped, not bare.
@@ -646,7 +653,7 @@ The auth step delegates to the legacy checker. [^auth]
   it("index.html groups pages by their source_files[0] top-level folder with per-group counts", async () => {
     const outDir = path.join(dir, "docs", "use-cases");
     await fs.mkdir(outDir, { recursive: true });
-    const reportPage = (slug: string, title: string): string => `---
+    const groupedPage = (folder: string, slug: string, title: string): string => `---
 code2wiki_id: ${slug}-v1
 title: ${title}
 slug: ${slug}
@@ -656,7 +663,7 @@ last_generated: 2026-05-13T00:00:00Z
 last_commit: 0000000
 confidence: high
 source_files:
-  - path: Reports/${slug}.cfc
+  - path: ${folder}/${slug}.cfc
     lines: 1-3
 tags: []
 ---
@@ -669,42 +676,19 @@ Sample.
 
 <!-- code2wiki:managed:end -->
 `;
-    const timePage = `---
-code2wiki_id: time-clock-v1
-title: Time Clock
-slug: time-clock
-actor: An internal application caller
-status: active
-last_generated: 2026-05-13T00:00:00Z
-last_commit: 0000000
-confidence: high
-source_files:
-  - path: Time/clock.cfc
-    lines: 1-3
-tags: []
----
-
-<!-- code2wiki:managed:start id=time-clock-v1 -->
-
-## Summary
-
-Sample.
-
-<!-- code2wiki:managed:end -->
-`;
     await fs.writeFile(
       path.join(outDir, "report-a.md"),
-      reportPage("report-a", "Report A"),
+      groupedPage("Reports", "report-a", "Report A"),
       "utf-8",
     );
     await fs.writeFile(
       path.join(outDir, "report-b.md"),
-      reportPage("report-b", "Report B"),
+      groupedPage("Reports", "report-b", "Report B"),
       "utf-8",
     );
     await fs.writeFile(
       path.join(outDir, "time-clock.md"),
-      timePage,
+      groupedPage("Time", "time-clock", "Time Clock"),
       "utf-8",
     );
     captureConsole();
@@ -733,7 +717,7 @@ Sample.
 
     // Page-count is exposed in the preamble (used by ops to sanity-
     // check a generate run produced the expected output volume).
-    expect(idxHtml).toMatch(/3 page\(s\)/);
+    expect(idxHtml).toMatch(/<span class="count">3<\/span> page\(s\)/);
   });
 
   // A page whose source_files[0] path has no folder separator (file at
@@ -843,11 +827,11 @@ Sample.
   });
 
   // Group labels come straight from repo folder names, which are
-  // attacker-ish input: a folder named "<Fees> & Charges" must render
-  // escaped, never as live markup. Windows-style separators must also
-  // split ("Legacy\\win.cfc" groups under "Legacy"), and a page with NO
-  // source_files at all falls back to "(root)" instead of crashing on
-  // the missing array.
+  // attacker-ish input on a hosted product: a folder named
+  // "<Fees> & Charges" must render escaped, never as live markup.
+  // Windows-style separators must also split ("Legacy\\win.cfc" groups
+  // under "Legacy"), and a page with NO source_files at all falls back
+  // to "(root)" instead of crashing on the missing array.
   it("escapes HTML in group names, splits Windows paths, and buckets missing source_files under (root)", async () => {
     const outDir = path.join(dir, "docs", "use-cases");
     await fs.mkdir(outDir, { recursive: true });
@@ -971,5 +955,83 @@ Sample.
       "utf-8",
     );
     expect(cfHtml).toContain('closest("code,pre")');
+  });
+
+  // A page with no last_generated frontmatter must not render a
+  // dangling "Generated" meta line with an empty <time>. The banner's
+  // own Last synced timestamp is unaffected.
+  it("omits the Generated meta line when last_generated is missing", async () => {
+    const outDir = path.join(dir, "docs", "use-cases");
+    await fs.mkdir(outDir, { recursive: true });
+    await fs.writeFile(
+      path.join(outDir, "no-ts.md"),
+      `---
+code2wiki_id: no-ts-v1
+title: No Timestamp
+slug: no-ts
+actor: An internal application caller
+status: active
+last_commit: 0000000
+confidence: high
+source_files:
+  - path: src/no-ts.cfc
+    lines: 1-3
+tags: []
+---
+
+<!-- code2wiki:managed:start id=no-ts-v1 -->
+
+## Summary
+
+Sample.
+
+<!-- code2wiki:managed:end -->
+`,
+      "utf-8",
+    );
+    captureConsole();
+
+    await runPreview({ cwd: dir });
+
+    const previewDir = path.join(dir, ".code2wiki", "preview", "no-ts");
+    const cfHtml = await fs.readFile(
+      path.join(previewDir, "confluence.html"),
+      "utf-8",
+    );
+    const ntHtml = await fs.readFile(
+      path.join(previewDir, "notion.html"),
+      "utf-8",
+    );
+    expect(cfHtml).not.toContain('class="cf-meta"');
+    expect(ntHtml).not.toContain('class="nt-meta"');
+    // Banner still carries its own localizable timestamp.
+    expect(cfHtml).toMatch(/Last synced: <time data-c2w-localize/);
+  });
+
+  // gray-matter parses unquoted YAML timestamps into Date objects; the
+  // datetime attribute must be normalized back to ISO, not the
+  // nonstandard Date.toString() dump ("Tue May 12 2026 19:00:00 GMT...").
+  it("normalizes Date-parsed last_generated frontmatter to ISO in the datetime attribute", async () => {
+    const outDir = path.join(dir, "docs", "use-cases");
+    await fs.mkdir(outDir, { recursive: true });
+    await fs.writeFile(
+      path.join(outDir, "page-one.md"),
+      SAMPLE_PAGE("page-one", "Page One"),
+      "utf-8",
+    );
+    captureConsole();
+
+    await runPreview({ cwd: dir });
+
+    const cfHtml = await fs.readFile(
+      path.join(dir, ".code2wiki", "preview", "page-one", "confluence.html"),
+      "utf-8",
+    );
+    // SAMPLE_PAGE's unquoted `last_generated: 2026-05-13T00:00:00Z`
+    // comes back from gray-matter as a Date; the render must emit ISO.
+    expect(cfHtml).toContain(
+      '<div class="cf-meta">Generated <time data-c2w-localize datetime="2026-05-13T00:00:00.000Z"',
+    );
+    expect(cfHtml).not.toMatch(/datetime="[A-Z][a-z]{2} [A-Z][a-z]{2} \d{2} \d{4}/);
   });
 });

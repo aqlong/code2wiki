@@ -10,12 +10,55 @@
 
 Code2Wiki turns a source-code repository into **non-technical, use-case-style wiki pages**, the kind a business analyst, QA engineer, or auditor can actually read, and keeps them in sync with the code on every production release.
 
-Unlike developer-facing doc tools (Mintlify, Swimm, DeepWiki) and unlike enterprise-only legacy modernization platforms (EPAM ART, Sanciti RGEN, Kodesage), Code2Wiki is:
+Unlike developer-facing doc tools (Mintlify, Swimm, DeepWiki) and unlike enterprise-only legacy modernization platforms (EPAM ART, Sanciti RGEN, Kodesage), Code2Wiki is built for a different buyer and a different job:
+
+| | code2wiki | Mintlify | Swimm | DeepWiki | EPAM ART | Kodesage |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Primary audience** | BAs / QA / auditors | Developers | Developers | Developers | Enterprise IT | Enterprise IT |
+| **Self-serve pricing** | Yes | Yes | No [^1] | No [^2] | No [^3] | No |
+| **Pushes to Confluence / Notion** | Yes | No | No | No | No [^3] | No |
+| **CFML / legacy-stack support** | Yes | No | No | No | No [^3] | No [^4] |
+| **Commit-attributed audit log** | Yes | No | No | No | No [^3] | No |
+
+[^1]: Swimm pricing page shows no self-serve tier; a demo or sales contact is required. Unverified as of 2026-05-28.
+[^2]: DeepWiki has no public pricing page; self-serve availability unverified as of 2026-05-28.
+[^3]: EPAM ART page returned HTTP 403 during verification; cells are based on EPAM's general enterprise-consulting model. Unverified as of 2026-05-28.
+[^4]: Kodesage lists COBOL, RPG, Oracle Forms, and PowerBuilder as supported languages; CFML not mentioned as of 2026-05-28.
+
+Where competitors genuinely outperform code2wiki today: **Mintlify** has a more polished developer-portal UX and is the right choice for teams publishing API reference docs to external users. **Swimm** embeds docs inline with source files and auto-updates them when functions are renamed, giving a tighter inner-loop developer workflow than code2wiki offers. **DeepWiki** answers natural-language questions about a repo instantly with no generation step, which is faster for ad-hoc code exploration. **EPAM ART and Kodesage** bundle human consultants alongside tooling; if your team needs a fully managed legacy-modernization engagement rather than a self-service tool, those are more appropriate choices. (Sanciti RGEN could not be evaluated: the site was unreachable as of 2026-05-28.)
 
 - **Self-serve**: credit card, no sales call.
 - **Workflow-native**: pushes to your existing Confluence / Notion / GitHub Wiki on every merge.
 - **Audit-aware**: every doc change is attributed to a commit and replayable for SOX / HIPAA / FDA reviews.
 - **Legacy-friendly**: first-class support for ColdFusion (CFML), Java EE, .NET monoliths, where generalist tools fall over.
+
+## Screenshots
+
+Dashboard index showing recent runs, repo sync status, and the Getting Started guide:
+
+![code2wiki dashboard index](docs/images/demo-index.png)
+
+Confluence lookalike preview of a generated use-case page (local render, nothing published):
+
+![Confluence preview of a generated use-case page](docs/images/demo-confluence-preview.png)
+
+Notion lookalike preview of the same page:
+
+![Notion preview of a generated use-case page](docs/images/demo-notion-preview.png)
+
+### Demo showcase
+
+Live example output from two real codebases. CFML ContentBox and Java Spring PetClinic demos, with a 2-button switcher:
+
+![CFML ContentBox demo index -- 6 use-case cards with CTA banner and persona switcher](docs/images/demo-showcase-cfml.png)
+
+Java / Spring petclinic demo (same UI, different codebase):
+
+![Java Spring petclinic demo index -- 6 use-case cards including Register a New Pet Owner](docs/images/demo-showcase-java.png)
+
+What one of those cards opens: a BA-readable Confluence-format use-case page generated automatically from controller source:
+
+![Confluence-format use-case page: Register a New Pet Owner, generated from Spring PetClinic](docs/images/demo-showcase-confluence-usecase.png)
 
 ## Quickstart
 
@@ -39,11 +82,35 @@ node dist/cli/index.js generate --cwd /path/to/your/project
 
 The output lands in `./docs/use-cases/` by default, one Markdown file per use case, ready to paste into Confluence, Notion, or commit to your repo.
 
+## Languages supported (today)
+
+| Language | File types | Parser | Status |
+|---|---|---|---|
+| Java (Spring MVC, JAX-RS, plain) | `.java` | tree-sitter | ✅ Shipped |
+| CFML, script-style components | `.cfc` | Custom scanner | ✅ Shipped |
+| CFML, tag-style components | `.cfc` | Custom scanner | ✅ Shipped |
+| CFML, pages | `.cfm` | Custom scanner | ✅ Shipped |
+| Ruby (Rails controllers) | `.rb` | Custom scanner | ✅ Shipped |
+| Python (Django class-based + function views) | `.py` | Custom scanner | ✅ Shipped |
+
 ## LLM backends
 
-Code2Wiki supports two LLM backends. **Mock mode is the default**: no key needed, runs the full pipeline with placeholder text.
+Code2Wiki supports three LLM backends. **Mock mode is the default**: no key needed, runs the full pipeline with placeholder text.
 
-### Anthropic (default for real generation)
+### DeepSeek (default when DEEPSEEK_API_KEY is set)
+
+```bash
+export DEEPSEEK_API_KEY=sk-ds-...
+code2wiki generate --cwd /path/to/your/project
+```
+
+| Env var | Required | Description |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | ✅ | Your DeepSeek API key |
+| `DEEPSEEK_BASE_URL` | optional | API base URL (default `https://api.deepseek.com`) |
+| `DEEPSEEK_MODEL` | optional | Model name (default `deepseek-v4-flash`; `config.model` is NOT consulted on this backend) |
+
+### Anthropic
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -61,16 +128,17 @@ If your team routes external AI traffic through Azure OpenAI, set these env vars
 | `AZURE_OPENAI_DEPLOYMENT` | optional | Deployment name (defaults to `config.model`) |
 | `AZURE_OPENAI_API_VERSION` | optional | Defaults to `2024-10-21` |
 | `AZURE_OPENAI_MAX_COMPLETION_TOKENS` | optional | Defaults to `16384`. Set lower (e.g. `4096`) for non-reasoning deployments like `gpt-4o` to tighten cost; leave at default for o-series reasoning models (`o1`, `o3`, `gpt-5`, `gpt-5-mini`) which consume invisible chain-of-thought tokens against this budget |
-| `CODE2WIKI_LLM_BACKEND` | optional | Force `azure-openai` or `anthropic`; omit for auto-detect |
+| `CODE2WIKI_LLM_BACKEND` | optional | Force `deepseek`, `azure-openai`, or `anthropic`; omit for auto-detect |
 
 **Auto-detect rules** (in priority order):
 
 1. `config.mock=true` or `CODE2WIKI_MOCK=1` → always mock, no API call.
 2. `CODE2WIKI_LLM_BACKEND` env var → explicit override.
 3. `config.llmBackend` in `code2wiki.config.json` → explicit config.
-4. Both Azure key + endpoint present and `ANTHROPIC_API_KEY` absent → Azure.
+4. `DEEPSEEK_API_KEY` present → DeepSeek.
 5. `ANTHROPIC_API_KEY` present → Anthropic.
-6. Neither → mock (zero-cost smoke-test path).
+6. Both Azure key + endpoint present → Azure.
+7. Neither → mock (zero-cost smoke-test path).
 
 ```bash
 export AZURE_OPENAI_API_KEY=...
@@ -80,19 +148,9 @@ code2wiki generate --cwd /path/to/your/project
 ```
 
 > **Notes:**
-> - `--estimate-cost` requires `ANTHROPIC_API_KEY` and is not available when the Azure backend is active (Azure OpenAI does not expose a non-billed token-counting endpoint equivalent to Anthropic's `messages.countTokens`).
+> - `--estimate-cost` requires `ANTHROPIC_API_KEY` and is not available when the DeepSeek or Azure OpenAI backends are active (neither exposes a non-billed token-counting endpoint equivalent to Anthropic's `messages.countTokens`).
 > - For o-series reasoning models, very large source files can exhaust `max_completion_tokens` on internal reasoning alone, producing an empty response. The error message will say `finish_reason=length`; raise `AZURE_OPENAI_MAX_COMPLETION_TOKENS` or split the file.
 > - Retries (2x with exponential backoff) on transient 429/500 errors are handled automatically by the underlying `openai` SDK.
-
-## Languages supported (today)
-
-| Language | Parser | Status |
-|---|---|---|
-| Java (Spring, JAX-RS, plain) | tree-sitter-java | ✅ Working |
-| CFML, `.cfc` (tag style) | Custom scanner | ✅ Working |
-| CFML, `.cfc` (script style) | Custom scanner | ✅ Working |
-| CFML, `.cfm` pages | Custom scanner | ✅ Working |
-| Rails / Django / .NET | | Roadmap (week 5+) |
 
 ## Publishing to Confluence or Notion
 
@@ -187,8 +245,12 @@ Full design rationale in [`docs/architecture.md`](docs/architecture.md).
 
 Hand-curated gold-standard outputs that double as the regression test suite:
 
-- [`examples/spring-petclinic-owner-create/`](examples/spring-petclinic-owner-create/), Java/Spring controller, owner registration form
-- [`examples/masacms-publish-site/`](examples/masacms-publish-site/), CFML tag-based, site deployment to production
+| Example | Language | Pattern | What makes it interesting |
+|---|---|---|---|
+| [`spring-petclinic-owner-create/`](examples/spring-petclinic-owner-create/) | Java / Spring MVC | GET+POST form | `@InitBinder` hidden business rule; redirect-after-POST |
+| [`spring-petclinic-find-owners/`](examples/spring-petclinic-find-owners/) | Java / Spring MVC | Query + conditional redirect | 3-branch logic: empty / single-match auto-redirect / multi-match list |
+| [`masacms-publish-site/`](examples/masacms-publish-site/) | CFML (tag-based) | Event + multi-step publish | Complex side effects across cfquery, cfinvoke, cfmail |
+| [`django-blog-post-publish/`](examples/django-blog-post-publish/) | Python / Django | Class-based views | Edit + delete pair; `LoginRequiredMixin` ownership rule |
 
 Each example contains the upstream source pointer, the ideal Markdown output, and notes on what makes it interesting.
 
@@ -250,6 +312,71 @@ npm run dev        # run CLI without building (tsx)
 ```
 
 Tests run without an LLM key (deterministic mock mode). Real LLM integration requires `ANTHROPIC_API_KEY` and respects 24-hour prompt caching to keep costs low.
+
+## CLI reference
+
+Snapshot of `code2wiki --help` and each subcommand (captured from current source; refresh on every prompt-version bump).
+
+```
+Usage: code2wiki [options] [command]
+Generate non-technical, use-case-style wiki pages from source code
+
+Options:
+  -V, --version               output the version number
+  -h, --help                  display help for command
+
+Commands:
+  init        Create a default code2wiki.config.json
+  list        List candidate use cases the parser would extract
+  generate    Generate Markdown use cases under the configured output dir
+  validate    Validate config and the contents of the output directory
+  publish     Push generated docs to a wiki (target: confluence | notion)
+  claim       Adopt an existing wiki page as the source for a generated use case
+  preview     Render a browsable local preview (Confluence + Notion lookalikes)
+  audit       Inspect the hash-chained audit log (show | verify | keygen)
+  replay      Re-run audit entries through the current prompt; report diffs
+```
+
+**`generate` flags** (most-used subcommand):
+
+```
+  --cwd <dir>               Project root
+  --mock                    Skip LLM calls; produce deterministic mock output
+  --limit <n>               Cap number of candidates processed
+  --only <substring>        Filter candidates by source-file path
+  --name <name>             Exact function/method name match (suffix ok)
+  --since <ref>             Only regenerate files changed since this git ref
+  --estimate-cost           Count tokens + project USD cost; no LLM call
+  --min-confidence <level>  Skip pages below this confidence (high|medium|low)
+```
+
+**`publish` flags:**
+
+```
+  --cwd <dir>          Project root
+  --dry-run            Show what would be published without calling the API
+  --mode <mode>        greenfield (default) | claim | parallel
+  --ignore-collisions  In claim mode, proceed past unresolved collisions
+```
+
+**`audit` flags:**
+
+```
+  --cwd <dir>        Project root
+  --limit <n>        Number of recent entries to show
+  --require-signed   Fail if any entry is unsigned (verify only)
+  --key-path <path>  Output path for generated private key PEM (keygen only)
+```
+
+**`replay` flags:**
+
+```
+  --cwd <dir>                Project root
+  --since <commit>           Only replay entries from this commit forward
+  --since-version <version>  Only replay entries produced at or before this prompt version
+  --limit <n>                Cap distinct slugs to replay (after dedupe)
+  --mock                     Use deterministic mock output (no API call)
+```
 
 ## License
 

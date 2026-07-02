@@ -2,6 +2,25 @@
 
 Notable changes to code2wiki. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); during pre-MVP we group by week rather than by released version since there's no public release cadence yet.
 
+## Unreleased, pre-MVP, design-partner phase (2026-06 / 2026-07)
+
+### LLM backends
+
+- **Azure OpenAI backend** (ADR-043): `resolveBackend()` selects Anthropic / Azure OpenAI / mock from env + config. Identical prompts across backends; `--estimate-cost` stays Anthropic-only with an actionable error elsewhere. Originated as public fork PR aqlong/code2wiki#1.
+- **DeepSeek backend** (ADR-045): third backend over the same `openai` SDK (custom `baseURL`). `DEEPSEEK_API_KEY` activates it; in auto-detect DeepSeek outranks Anthropic, pin `CODE2WIKI_LLM_BACKEND=anthropic` if both keys are set. Default model `deepseek-v4-flash`.
+- **Backend-selection hardening**: typo'd `CODE2WIKI_LLM_BACKEND` values fail fast instead of silently auto-detecting; empty Anthropic responses are diagnosed instead of surfacing as an opaque JSON parse error; Azure env validation covers both trigger paths.
+
+### Preview quality
+
+- **Grouped index**: `code2wiki preview`'s `index.html` buckets pages by `source_files[0]` top-level folder with per-group counts; root-level files land under `(root)`. Groups sort alphabetically, pages by title within each group. Originated as public fork PR aqlong/code2wiki#2.
+- **Viewer-local timestamps**: banner `Last synced`, per-page `Generated` meta, index `Generated`, and bare ISO-8601 strings inside rendered bodies all display in the viewer's timezone with the original ISO preserved as a hover tooltip. Script is injected at the END of `<body>` (placement is load-bearing and test-pinned; a head-placed script runs before the DOM exists and silently no-ops). Text inside `code`/`pre` is exempt so example payloads stay literal.
+- **Confidence badges** on the index and both per-page lookalikes (high / medium / low), matching the hosted dashboard's per-page rating.
+- **Renderer footer fix**: the generated-page footer is plain ISO text again; an inline `<time>` tag briefly shipped on 2026-07-02 rendered as literal escaped markup on published Confluence pages and was reverted the same day with a regression test.
+
+### Tooling
+
+- **Em-dash scrubber fixes**: `strip-em-dashes.py` now matches skip fragments against repo-root-relative paths, so runs from inside a git worktree scan files instead of passing vacuously; `.py`, `.example`, and `.json` files joined the scan set (the scrubber + its test self-skip); two `.env.example` files scrubbed.
+
 ## Unreleased, pre-MVP, design-partner phase (2026-05)
 
 ### Self-learning + quality loops

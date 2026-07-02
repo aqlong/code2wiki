@@ -326,8 +326,39 @@ class ShouldSkipTests(unittest.TestCase):
                 "/examples/",
                 "/.claude/worktrees/",
                 "/tools/ocean-bot/",
+                "/tools/scripts/strip-em-dashes.py",
+                "/tools/scripts/strip-em-dashes.test.py",
             ),
         )
+
+    def test_scrubber_and_its_test_skip_themselves(self):
+        # *.py is scanned since 2026-07-02, so the scrubber + this test
+        # file (both contain em-dash literals by design: the EM constant
+        # and fixture strings) MUST self-skip or every CI run corrupts
+        # the linter itself.
+        root = _script.REPO_ROOT
+        self.assertTrue(should_skip(root / "tools/scripts/strip-em-dashes.py"))
+        self.assertTrue(
+            should_skip(root / "tools/scripts/strip-em-dashes.test.py")
+        )
+
+    def test_repo_root_inside_worktree_does_not_skip_everything(self):
+        # should_skip matches the path RELATIVE to REPO_ROOT. When the
+        # repo root itself lives under a skip fragment (a git worktree at
+        # ~/code2wiki/.claude/worktrees/<name>/ is the live case), the
+        # old absolute-path match skipped EVERY file and the check passed
+        # vacuously ("0 em dashes found across 0 files"). Live-buggy in
+        # every worktree session until 2026-07-02.
+        with tempfile.TemporaryDirectory() as td:
+            wt_root = Path(td) / ".claude" / "worktrees" / "some-worktree"
+            (wt_root / "src").mkdir(parents=True)
+            f = wt_root / "src" / "normal.ts"
+            f.write_text("const x = 1;\n")
+            with _isolated_repo_root(wt_root):
+                self.assertFalse(should_skip(f))
+                # Skip fragments still work relative to the worktree root.
+                nm = wt_root / "node_modules" / "pkg" / "index.ts"
+                self.assertTrue(should_skip(nm))
 
     def test_every_skip_fragment_has_positive_path_coverage(self):
         # Defends against a future contributor adding a fragment to
@@ -592,14 +623,12 @@ class MainTests(unittest.TestCase):
             self.assertIn("#!/usr/bin/env bash", txt)
 
     def test_ignores_unsupported_extensions(self):
-        # A file with a non-allowlisted extension (e.g., .py) must NOT
-        # be touched even if it contains an em dash. .py is the load-
-        # bearing case here: strip-em-dashes.py and its test file both
-        # contain legitimate em-dash literals (the EM constant + fixture
-        # input strings) that the script must leave alone, otherwise a
-        # CI run would corrupt the linter itself.
+        # A file with a non-allowlisted extension must NOT be touched
+        # even if it contains an em dash. (.py used to be the fixture
+        # here; since 2026-07-02 .py IS scanned and the scrubber + its
+        # test self-skip via SKIP_PATH_FRAGMENTS instead.)
         with tempfile.TemporaryDirectory() as td:
-            p = Path(td) / "code.py"
+            p = Path(td) / "notes.txt"
             original = f"# foo {EM} bar\n"
             p.write_text(original)
             _run_main(Path(td))

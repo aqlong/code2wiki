@@ -67,15 +67,34 @@ export async function runPreview(opts: PreviewOptions): Promise<void> {
     commit: "preview",
   });
 
-  // Pass 1: read every page's slug, title, and body so we can pass the
-  // full page list into the Confluence renderer in pass 2 (for the
-  // sidebar and breadcrumb navigation).
-  const allPages: Array<{ slug: string; title: string; content: string; group?: string }> = [];
+  // Pass 1: read every page's slug, title, body, confidence, and
+  // last_generated so we can render badges and timestamps in pass 2.
+  interface PageEntry {
+    slug: string;
+    title: string;
+    confidence: string;
+    lastGenerated: string;
+    content: string;
+    group?: string;
+  }
+  const allPages: PageEntry[] = [];
   for (const f of files) {
     const slug = f.replace(/\.md$/, "");
     const raw = await fs.readFile(path.join(outDir, f), "utf-8");
     const fm = matter(raw);
     const title = (fm.data["title"] as string | undefined) ?? slug;
+    const confidence = fm.data["confidence"]
+      ? String(fm.data["confidence"])
+      : "unknown";
+    // gray-matter parses unquoted YAML timestamps into Date objects;
+    // normalize back to ISO so <time datetime=""> stays machine-readable.
+    const rawGenerated = fm.data["last_generated"];
+    const lastGenerated =
+      rawGenerated instanceof Date
+        ? rawGenerated.toISOString()
+        : rawGenerated
+          ? String(rawGenerated)
+          : "";
     // Derive a grouping hint from the first source_file path so the
     // index can mirror the codebase layout (e.g. "Reports", "Time", root).
     let group: string | undefined;
@@ -85,11 +104,11 @@ export async function runPreview(opts: PreviewOptions): Promise<void> {
       const parts = firstPath.split(/[\\/]/);
       group = parts.length > 1 ? parts[0] : "(root)";
     }
-    allPages.push({ slug, title, content: fm.content, group });
+    allPages.push({ slug, title, confidence, lastGenerated, content: fm.content, group });
   }
 
   // Pass 2: render and write all artifacts, now that allPages is complete.
-  for (const { slug, title, content } of allPages) {
+  for (const { slug, title, confidence, lastGenerated, content } of allPages) {
     const pageDir = path.join(previewDir, slug);
     await fs.mkdir(pageDir, { recursive: true });
 
@@ -102,7 +121,7 @@ export async function runPreview(opts: PreviewOptions): Promise<void> {
     );
     await fs.writeFile(
       path.join(pageDir, "confluence.html"),
-      renderConfluenceHtml(title, content, banner, slug, allPages),
+      renderConfluenceHtml(title, confidence, lastGenerated, content, banner, slug, allPages),
       "utf-8",
     );
 
@@ -118,7 +137,7 @@ export async function runPreview(opts: PreviewOptions): Promise<void> {
     );
     await fs.writeFile(
       path.join(pageDir, "notion.html"),
-      renderNotionHtml(title, content, banner),
+      renderNotionHtml(title, confidence, lastGenerated, content, banner),
       "utf-8",
     );
   }
@@ -126,7 +145,7 @@ export async function runPreview(opts: PreviewOptions): Promise<void> {
   // Top-level index.
   await fs.writeFile(
     path.join(previewDir, "index.html"),
-    renderIndex(allPages),
+    renderIndex(allPages, banner.repoName),
     "utf-8",
   );
 
@@ -160,8 +179,9 @@ export async function runPreview(opts: PreviewOptions): Promise<void> {
 // add real complexity for limited benefit on a young project. If drift
 // surfaces, extract to a workspace pkg.
 
-function escapeHtml(s: string): string {
-  return s
+function escapeHtml(s: unknown): string {
+  const str = s == null ? "" : String(s);
+  return str
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -198,8 +218,21 @@ function wrapConfluenceForBrowser(payload: string): string {
   );
 }
 
+function confidenceBadge(level: string, prefix = "cf"): string {
+  const text = escapeHtml(level);
+  const suffix =
+    level === "high"
+      ? "high"
+      : level === "medium"
+        ? "medium"
+        : "low";
+  return `<span class="${prefix}-confidence ${prefix}-confidence-${suffix}">${text}</span>`;
+}
+
 function renderConfluenceHtml(
   title: string,
+  confidence: string,
+  lastGenerated: string,
   bodyMarkdown: string,
   banner: BannerInputs,
   currentSlug: string,
@@ -231,7 +264,12 @@ function renderConfluenceHtml(
   .cf-sidebar li a:hover { color:var(--cf-link); }
   .cf-main { max-width:880px; padding:2.5em 3em 4em; }
   .cf-crumbs { font-size:0.85em; color:var(--cf-text-subtle); margin-bottom:1em; }
-  h1.cf-title { font-size:28px; font-weight:600; margin:0 0 0.8em; line-height:1.25; }
+  h1.cf-title { font-size:28px; font-weight:600; margin:0 0 0.2em; line-height:1.25; }
+  .cf-confidence { display:inline-block; padding:0.1em 0.5em; border-radius:3px; font-size:0.7em; font-weight:600; vertical-align:middle; margin-left:0.5em; }
+  .cf-confidence-high { background:#e3fcef; color:#006644; }
+  .cf-confidence-medium { background:#fff0b3; color:#7a5d00; }
+  .cf-confidence-low { background:#ffebe6; color:#bf2600; }
+  .cf-meta { font-size:0.85em; color:var(--cf-text-subtle); margin:0 0 1.2em; }
   .cf-info { background:var(--cf-info-bg); border-left:4px solid var(--cf-info-border); padding:0.9em 1.1em; margin:0 0 1.6em; border-radius:3px; }
   .cf-info p { margin:0; }
   .cf-info a { color:var(--cf-link); }
@@ -251,7 +289,8 @@ function renderConfluenceHtml(
   <aside class="cf-sidebar"><div class="cf-space">Auto-generated docs</div><div class="cf-space-key">Space PREVIEW</div><ul>${sidebarItems}</ul></aside>
   <main class="cf-main">
     <div class="cf-crumbs"><a href="../index.html">Spaces</a> / <a href="../index.html">Auto-generated docs</a> / ${escapeHtml(title)}</div>
-    <h1 class="cf-title">${escapeHtml(title)}</h1>
+    <h1 class="cf-title">${escapeHtml(title)} ${confidenceBadge(confidence)}</h1>
+    ${lastGenerated ? `<div class="cf-meta">Generated <time data-c2w-localize datetime="${escapeHtml(lastGenerated)}" title="${escapeHtml(lastGenerated)}">${escapeHtml(lastGenerated)}</time></div>` : ""}
     <div class="cf-info"><p>${bannerHtml(banner)}</p></div>
     <div class="cf-body">${bodyHtml}</div>
   </main>
@@ -260,6 +299,8 @@ function renderConfluenceHtml(
 
 function renderNotionHtml(
   title: string,
+  confidence: string,
+  lastGenerated: string,
   bodyMarkdown: string,
   banner: BannerInputs,
 ): string {
@@ -273,6 +314,11 @@ function renderNotionHtml(
   body { margin:0; font:16px/1.5 ui-sans-serif,-apple-system,"Segoe UI",sans-serif; color:var(--nt-text); background:#fff; }
   .nt-shell { max-width:720px; margin:0 auto; padding:4em 1.5em 6em; }
   h1.nt-title { font-size:40px; font-weight:700; line-height:1.2; margin:0 0 1em; letter-spacing:-0.01em; }
+  .nt-confidence { display:inline-block; padding:0.1em 0.5em; border-radius:3px; font-size:0.6em; font-weight:600; vertical-align:middle; margin-left:0.6em; }
+  .nt-confidence-high { background:#deece6; color:#0f7b49; }
+  .nt-confidence-medium { background:#f5edcf; color:#8f6d00; }
+  .nt-confidence-low { background:#f0d2cd; color:#b53b2c; }
+  .nt-meta { font-size:0.85em; color:var(--nt-text); opacity:0.6; margin:-0.5em 0 1.4em; }
   .nt-callout { display:flex; gap:0.9em; background:var(--nt-callout-bg); border-radius:4px; padding:1em 1.2em; margin:0 0 1.4em; font-size:0.95em; }
   .nt-callout .nt-emoji { font-size:1.2em; line-height:1.4; }
   .nt-body h1,.nt-body h2,.nt-body h3 { font-weight:700; margin:1.6em 0 0.4em; }
@@ -289,7 +335,8 @@ function renderNotionHtml(
   .nt-body details { background:var(--nt-callout-bg); border-radius:4px; padding:0.6em 1em; margin:0.8em 0; }
 </style></head><body>
 <div class="nt-shell">
-  <h1 class="nt-title">${escapeHtml(title)}</h1>
+  <h1 class="nt-title">${escapeHtml(title)} ${confidenceBadge(confidence)}</h1>
+  ${lastGenerated ? `<div class="nt-meta">Generated <time data-c2w-localize datetime="${escapeHtml(lastGenerated)}" title="${escapeHtml(lastGenerated)}">${escapeHtml(lastGenerated)}</time></div>` : ""}
   <div class="nt-callout"><div class="nt-emoji">📝</div><div class="nt-callout-text">${bannerHtml(banner)}</div></div>
   <div class="nt-body">${bodyHtml}</div>
 </div>${LOCALIZE_TIME_SCRIPT}</body></html>`;
@@ -307,16 +354,19 @@ function bannerHtml(banner: BannerInputs): string {
 }
 
 /**
- * Inline script injected into every preview page. Rewrites any
- * <time data-c2w-localize datetime="...Z"> to the viewer's local time
- * with their IANA / abbreviated timezone, while preserving the original
- * ISO value as the `title` tooltip for traceability.
+ * Inline script injected at the END of every preview page's <body>.
+ * Rewrites any <time data-c2w-localize datetime="...Z"> to the viewer's
+ * local time with their IANA / abbreviated timezone, while preserving the
+ * original ISO value as the `title` tooltip for traceability.
  *
  * Also scans the rendered document body for bare ISO-8601 UTC timestamps
  * (produced by the LLM in YAML frontmatter rendering or footers) and
  * localizes them too, so reviewers never see raw `2026-06-01T15:09:22.047Z`.
  * Text inside <code>/<pre> is exempt: code samples (example payloads,
  * fixture JSON) must display exactly what the source shows.
+ *
+ * Placement is load-bearing: a synchronous script in <head> runs before
+ * the body is parsed and silently rewrites nothing.
  */
 const LOCALIZE_TIME_SCRIPT = `<script>
 (function(){
@@ -379,7 +429,11 @@ const LOCALIZE_TIME_SCRIPT = `<script>
 })();
 </script>`;
 
-function renderIndex(entries: Array<{ slug: string; title: string; group?: string }>): string {
+function renderIndex(
+  entries: Array<{ slug: string; title: string; confidence: string; lastGenerated: string; group?: string }>,
+  repoName?: string,
+): string {
+  const name = repoName ? escapeHtml(repoName) : "this project";
   const grouped = new Map<string, typeof entries>();
   for (const e of entries) {
     const g = e.group || "(root)";
@@ -395,7 +449,7 @@ function renderIndex(entries: Array<{ slug: string; title: string; group?: strin
         .map(
           (e) =>
             `<li>
-  <strong>${escapeHtml(e.title)}</strong>
+  <strong>${escapeHtml(e.title)} ${confidenceBadge(e.confidence, "ix")}</strong>
   <div class="links">
     <a href="${e.slug}/confluence.html">Confluence preview</a> ·
     <a href="${e.slug}/notion.html">Notion preview</a>
@@ -409,12 +463,14 @@ function renderIndex(entries: Array<{ slug: string; title: string; group?: strin
     .join("\n");
   const nowIso = new Date().toISOString();
   return `<!doctype html>
-<html><head><meta charset="utf-8"><title>code2wiki local preview</title>
+<html><head><meta charset="utf-8"><title>code2wiki preview: ${name}</title>
 <style>
   body { font:14px/1.55 -apple-system,system-ui,sans-serif; max-width:880px; margin:2em auto; padding:0 1em; }
   h1 { font-size:1.6em; border-bottom:1px solid #ddd; padding-bottom:0.3em; }
   h2 { font-size:1.1em; margin-top:1.6em; color:#444; border-bottom:1px solid #eee; padding-bottom:0.2em; }
   h2 .count { color:#999; font-weight:400; font-size:0.9em; }
+  .preamble { color:#555; margin-bottom:0.5em; }
+  .preamble .count { font-weight:600; }
   ul { padding-left:0; list-style:none; }
   li { margin:0.6em 0; padding:0.6em 0.8em; background:#f9f9f9; border-radius:4px; }
   li strong { display:block; margin-bottom:0.2em; }
@@ -423,10 +479,13 @@ function renderIndex(entries: Array<{ slug: string; title: string; group?: strin
   .links a:hover { text-decoration:underline; }
   .raw { color:#999; margin-left:1em; font-size:0.9em; }
   .raw a { color:#888; }
-  .preamble { color:#555; }
+  .ix-confidence { display:inline-block; padding:0.05em 0.4em; border-radius:3px; font-size:0.65em; font-weight:600; vertical-align:middle; margin-left:0.4em; }
+  .ix-confidence-high { background:#e3fcef; color:#006644; }
+  .ix-confidence-medium { background:#fff0b3; color:#7a5d00; }
+  .ix-confidence-low { background:#ffebe6; color:#bf2600; }
 </style></head><body>
 <h1>code2wiki local preview</h1>
-<p class="preamble">Browsable preview of what each generated page would look like once published. No network calls; nothing was published. ${entries.length} page(s). Generated <time data-c2w-localize datetime="${nowIso}" title="${nowIso}">${nowIso}</time>.</p>
+<p class="preamble">Browsable preview for <strong>${name}</strong>: <span class="count">${entries.length}</span> page(s). Generated <time data-c2w-localize datetime="${nowIso}" title="${nowIso}">${nowIso}</time>. No network calls; nothing was published.</p>
 ${sections}
 ${LOCALIZE_TIME_SCRIPT}
 </body></html>`;

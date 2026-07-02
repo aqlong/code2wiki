@@ -1,8 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
   computeEstimate,
-  INPUT_RATE_PER_TOKEN,
-  OUTPUT_RATE_PER_TOKEN,
+  ANTHROPIC_INPUT_RATE_PER_TOKEN,
+  ANTHROPIC_OUTPUT_RATE_PER_TOKEN,
+  DEEPSEEK_INPUT_RATE_PER_TOKEN,
+  DEEPSEEK_OUTPUT_RATE_PER_TOKEN,
   CACHE_DISCOUNT_MULTIPLIER,
   DEFAULT_OUTPUT_TOKENS_PER_PAGE,
 } from "./cost.js";
@@ -131,6 +133,37 @@ describe("computeEstimate: outputTokensPerPage override", () => {
     );
     expect(est.estimatedOutputTokens).toBe(DEFAULT_OUTPUT_TOKENS_PER_PAGE);
   });
+
+  it("uses DeepSeek pricing rates when backend='deepseek'", () => {
+    // 1000 system + 1000 user tokens, 1 page
+    const est = computeEstimate(
+      [{ systemTokens: 1000, userTokens: 1000 }],
+      { backend: "deepseek" },
+    );
+    // DeepSeek: no cache discount, 0.27/MTok input, 1.10/MTok output
+    // cachedInput = 1000 * (0.27/1M) * 1 = 0.00027
+    // uncachedInput = 1000 * (0.27/1M) = 0.00027
+    // output = 3000 * (1.10/1M) = 0.0033
+    expect(est.cachedInputCostUsd).toBeCloseTo(0.00027, 10);
+    expect(est.uncachedInputCostUsd).toBeCloseTo(0.00027, 10);
+    expect(est.outputCostUsd).toBeCloseTo(0.0033, 10);
+  });
+
+  it("DeepSeek does NOT apply cache discount (cachedInput == uncachedInput for same token count)", () => {
+    // Symmetric system-only vs user-only: with no cache discount, identical
+    // token counts should yield identical input costs.
+    const sys = computeEstimate(
+      [{ systemTokens: 1000, userTokens: 0 }],
+      { backend: "deepseek" },
+    );
+    const user = computeEstimate(
+      [{ systemTokens: 0, userTokens: 1000 }],
+      { backend: "deepseek" },
+    );
+    expect(sys.cachedInputCostUsd).toBeCloseTo(user.uncachedInputCostUsd, 10);
+    expect(sys.uncachedInputCostUsd).toBe(0);
+    expect(user.cachedInputCostUsd).toBe(0);
+  });
 });
 
 describe("exported pricing constants", () => {
@@ -138,12 +171,12 @@ describe("exported pricing constants", () => {
   // bumping them without updating the docs (or vice versa) surfaces
   // here. Anthropic could change real pricing, in which case the bump
   // is intentional and both source + test get updated together.
-  it("INPUT_RATE_PER_TOKEN is $3 per million tokens", () => {
-    expect(INPUT_RATE_PER_TOKEN).toBe(3 / 1_000_000);
+  it("ANTHROPIC_INPUT_RATE_PER_TOKEN is $3 per million tokens", () => {
+    expect(ANTHROPIC_INPUT_RATE_PER_TOKEN).toBe(3 / 1_000_000);
   });
 
-  it("OUTPUT_RATE_PER_TOKEN is $15 per million tokens", () => {
-    expect(OUTPUT_RATE_PER_TOKEN).toBe(15 / 1_000_000);
+  it("ANTHROPIC_OUTPUT_RATE_PER_TOKEN is $15 per million tokens", () => {
+    expect(ANTHROPIC_OUTPUT_RATE_PER_TOKEN).toBe(15 / 1_000_000);
   });
 
   it("CACHE_DISCOUNT_MULTIPLIER is 0.5 (50% blended approximation)", () => {
@@ -152,5 +185,13 @@ describe("exported pricing constants", () => {
 
   it("DEFAULT_OUTPUT_TOKENS_PER_PAGE is 3000", () => {
     expect(DEFAULT_OUTPUT_TOKENS_PER_PAGE).toBe(3000);
+  });
+
+  it("DEEPSEEK_INPUT_RATE_PER_TOKEN is $0.27 per million tokens", () => {
+    expect(DEEPSEEK_INPUT_RATE_PER_TOKEN).toBe(0.27 / 1_000_000);
+  });
+
+  it("DEEPSEEK_OUTPUT_RATE_PER_TOKEN is $1.10 per million tokens", () => {
+    expect(DEEPSEEK_OUTPUT_RATE_PER_TOKEN).toBe(1.10 / 1_000_000);
   });
 });

@@ -1,28 +1,30 @@
 /**
  * Pure cost-estimation helper backing `code2wiki generate --estimate-cost`.
  *
- * Pricing model (matches client.ts caching layout):
- *   - Input: $3/MTok base
- *   - Output: $15/MTok
- *   - System prompt has `cache_control: { type: "ephemeral" }` in
- *     extractWithLLM, so we apply a 50% discount to the system-token
- *     portion of input (per spec). The user prompt is NOT cached
- *     (per-candidate full source attachment differs every call), so
- *     it pays the full input rate.
+ * Supports two pricing tiers:
+ *   - Anthropic (default): Input $3/MTok, Output $15/MTok, 50% cache discount
+ *     on system tokens (matches client.ts cache_control layout).
+ *   - DeepSeek:          Input $0.27/MTok, Output $1.10/MTok, no cache discount.
  *
- * This intentionally simplifies Anthropic's real cache pricing (cache
- * write 1.25x, cache read 0.1x), the 50% blended discount is the spec's
- * chosen approximation; revisit if estimates drift materially from
- * actual bills.
+ * Azure OpenAI is NOT supported here (no non-billed token-count endpoint),
+ * so countTokens throws before this function is reached on the Azure path.
  *
  * Pure function so the unit tests can hand-compute expected values
  * without mocking the SDK.
  */
 
-export const INPUT_RATE_PER_TOKEN = 3 / 1_000_000;
-export const OUTPUT_RATE_PER_TOKEN = 15 / 1_000_000;
+import type { LLMBackend } from "./client.js";
+
+export const ANTHROPIC_INPUT_RATE_PER_TOKEN = 3 / 1_000_000;
+export const ANTHROPIC_OUTPUT_RATE_PER_TOKEN = 15 / 1_000_000;
+export const DEEPSEEK_INPUT_RATE_PER_TOKEN = 0.27 / 1_000_000;
+export const DEEPSEEK_OUTPUT_RATE_PER_TOKEN = 1.10 / 1_000_000;
 export const CACHE_DISCOUNT_MULTIPLIER = 0.5;
 export const DEFAULT_OUTPUT_TOKENS_PER_PAGE = 3000;
+
+// Backward-compat aliases for existing consumers.
+export const INPUT_RATE_PER_TOKEN = ANTHROPIC_INPUT_RATE_PER_TOKEN;
+export const OUTPUT_RATE_PER_TOKEN = ANTHROPIC_OUTPUT_RATE_PER_TOKEN;
 
 export interface PerCandidateTokens {
   systemTokens: number;
@@ -43,12 +45,18 @@ export interface CostEstimate {
 export interface EstimateOptions {
   /** Tokens per page projected for output. Default 3000 (the spec). */
   outputTokensPerPage?: number;
+  /** LLM backend for pricing. Defaults to "anthropic" rates. */
+  backend?: LLMBackend;
 }
 
 export function computeEstimate(
   perCandidate: PerCandidateTokens[],
   options: EstimateOptions = {},
 ): CostEstimate {
+  const isDeepSeek = options.backend === "deepseek";
+  const inputRate = isDeepSeek ? DEEPSEEK_INPUT_RATE_PER_TOKEN : ANTHROPIC_INPUT_RATE_PER_TOKEN;
+  const outputRate = isDeepSeek ? DEEPSEEK_OUTPUT_RATE_PER_TOKEN : ANTHROPIC_OUTPUT_RATE_PER_TOKEN;
+
   const outputTokensPerPage =
     options.outputTokensPerPage ?? DEFAULT_OUTPUT_TOKENS_PER_PAGE;
   const pages = perCandidate.length;
@@ -61,10 +69,12 @@ export function computeEstimate(
     0,
   );
   const estimatedOutputTokens = pages * outputTokensPerPage;
+  // DeepSeek has no prompt caching; Anthropic applies a 50% cache discount to system tokens.
+  const cacheDiscount = isDeepSeek ? 1 : CACHE_DISCOUNT_MULTIPLIER;
   const cachedInputCostUsd =
-    totalSystemInputTokens * INPUT_RATE_PER_TOKEN * CACHE_DISCOUNT_MULTIPLIER;
-  const uncachedInputCostUsd = totalUserInputTokens * INPUT_RATE_PER_TOKEN;
-  const outputCostUsd = estimatedOutputTokens * OUTPUT_RATE_PER_TOKEN;
+    totalSystemInputTokens * inputRate * cacheDiscount;
+  const uncachedInputCostUsd = totalUserInputTokens * inputRate;
+  const outputCostUsd = estimatedOutputTokens * outputRate;
   const totalUsd =
     cachedInputCostUsd + uncachedInputCostUsd + outputCostUsd;
 

@@ -12,6 +12,11 @@ const { messagesCreate, messagesCountTokens, anthropicCtor } = vi.hoisted(() => 
   anthropicCtor: vi.fn(),
 }));
 
+const { deepseekChatCreate, deepseekOpenAICtor } = vi.hoisted(() => ({
+  deepseekChatCreate: vi.fn(),
+  deepseekOpenAICtor: vi.fn(),
+}));
+
 vi.mock("@anthropic-ai/sdk", () => ({
   default: vi.fn().mockImplementation((opts: { apiKey?: string }) => {
     anthropicCtor(opts);
@@ -28,6 +33,12 @@ const { azureChatCreate, azureOpenAICtor } = vi.hoisted(() => ({
 }));
 
 vi.mock("openai", () => ({
+  default: vi.fn().mockImplementation(
+    (opts: { apiKey?: string; baseURL?: string }) => {
+      deepseekOpenAICtor(opts);
+      return { chat: { completions: { create: deepseekChatCreate } } };
+    },
+  ),
   AzureOpenAI: vi
     .fn()
     .mockImplementation(
@@ -87,8 +98,10 @@ beforeEach(() => {
   anthropicCtor.mockReset();
   azureChatCreate.mockReset();
   azureOpenAICtor.mockReset();
+  deepseekChatCreate.mockReset();
+  deepseekOpenAICtor.mockReset();
   // Default to "Anthropic SDK path is reachable"; every test that wants mock
-  // mode or Azure mode overrides exactly what it needs.
+  // mode or Azure/DeepSeek mode overrides exactly what it needs.
   vi.stubEnv("ANTHROPIC_API_KEY", "test-key");
   vi.stubEnv("CODE2WIKI_MOCK", "");
   vi.stubEnv("CODE2WIKI_LLM_BACKEND", "");
@@ -99,6 +112,11 @@ beforeEach(() => {
   vi.stubEnv("AZURE_OPENAI_DEPLOYMENT", "");
   vi.stubEnv("AZURE_OPENAI_API_VERSION", "");
   vi.stubEnv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "");
+  // Clear DeepSeek env vars so tests that don't set them don't accidentally
+  // trigger the DeepSeek path.
+  vi.stubEnv("DEEPSEEK_API_KEY", "");
+  vi.stubEnv("DEEPSEEK_BASE_URL", "");
+  vi.stubEnv("DEEPSEEK_MODEL", "");
 });
 
 afterEach(() => {
@@ -450,6 +468,48 @@ describe("extractWithLLM, response parsing", () => {
       }),
     ).rejects.toThrow(/LLM did not return valid JSON/);
   });
+
+  it("throws a max_tokens diagnostic on empty content (Anthropic path, mirrors Azure length-cap)", async () => {
+    // A truncated response (budget exhausted before any visible text) must
+    // surface the cause, not the generic "did not return valid JSON" with an
+    // empty snippet that parseJsonObject('') would otherwise throw.
+    messagesCreate.mockResolvedValueOnce({
+      content: [{ type: "text", text: "" }],
+      stop_reason: "max_tokens",
+    });
+    await expect(
+      extractWithLLM({
+        candidate: CANDIDATE,
+        projectName: "demo",
+        config: CONFIG,
+      }),
+    ).rejects.toThrow(/Anthropic returned empty content\. stop_reason=max_tokens/);
+  });
+
+  it("throws a refusal diagnostic on empty content with stop_reason=refusal", async () => {
+    messagesCreate.mockResolvedValueOnce({
+      content: [],
+      stop_reason: "refusal",
+    });
+    await expect(
+      extractWithLLM({
+        candidate: CANDIDATE,
+        projectName: "demo",
+        config: CONFIG,
+      }),
+    ).rejects.toThrow(/Anthropic returned empty content\. stop_reason=refusal/);
+  });
+
+  it("falls back to stop_reason=unknown when content is empty and stop_reason is absent", async () => {
+    messagesCreate.mockResolvedValueOnce({ content: [] });
+    await expect(
+      extractWithLLM({
+        candidate: CANDIDATE,
+        projectName: "demo",
+        config: CONFIG,
+      }),
+    ).rejects.toThrow(/Anthropic returned empty content\. stop_reason=unknown/);
+  });
 });
 
 describe("countTokens, two-call subtract-for-system math", () => {
@@ -596,6 +656,18 @@ describe("resolveBackend", () => {
     expect(() => resolveBackend(CONFIG)).toThrow(/AZURE_OPENAI_API_KEY/);
   });
 
+  it("throws when config.llmBackend=azure-openai but Azure creds are missing (error mentions config.json, not just CODE2WIKI_LLM_BACKEND)", () => {
+    // validateAzureEnv() is called from two code paths: the CODE2WIKI_LLM_BACKEND
+    // env-var path AND the config.llmBackend path. The error advice must be
+    // accurate for both. A regression that only mentioned "remove
+    // CODE2WIKI_LLM_BACKEND" would be misleading when the user's trigger was
+    // the config file instead.
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    expect(() =>
+      resolveBackend({ ...CONFIG, llmBackend: "azure-openai" }),
+    ).toThrow(/code2wiki\.config\.json/);
+  });
+
   it("returns 'azure-openai' when config.llmBackend=azure-openai and Azure creds are set", () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "");
     vi.stubEnv("AZURE_OPENAI_API_KEY", "az-key");
@@ -622,9 +694,236 @@ describe("resolveBackend", () => {
     // Even if config says azure-openai, env var wins
     expect(resolveBackend({ ...CONFIG, llmBackend: "azure-openai" })).toBe("anthropic");
   });
+
+  it("throws on a typo'd CODE2WIKI_LLM_BACKEND instead of silently auto-detecting", () => {
+    // Operator meant "azure-openai" but dropped "-openai". Without the guard
+    // this silently falls through to auto-detect and (with ANTHROPIC_API_KEY
+    // also set) routes to Anthropic, the wrong provider on the wrong bill.
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "azure");
+    vi.stubEnv("AZURE_OPENAI_API_KEY", "az-key");
+    vi.stubEnv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com");
+    expect(() => resolveBackend(CONFIG)).toThrow(/CODE2WIKI_LLM_BACKEND must be one of/);
+  });
+
+  it("treats CODE2WIKI_LLM_BACKEND='auto' (and empty) as auto-detect, not a typo", () => {
+    // "auto" is an explicit, valid pass-through (the config enum accepts it
+    // too); it must NOT throw. Empty string is the unset sentinel.
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "auto");
+    expect(resolveBackend(CONFIG)).toBe("anthropic");
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "");
+    expect(resolveBackend(CONFIG)).toBe("anthropic");
+  });
+
+  // ── DeepSeek resolveBackend tests ────────────────────────────────────────────
+
+  it("returns 'deepseek' when CODE2WIKI_LLM_BACKEND=deepseek and DEEPSEEK_API_KEY is set", () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "deepseek");
+    vi.stubEnv("DEEPSEEK_API_KEY", "sk-ds-test-123");
+    expect(resolveBackend(CONFIG)).toBe("deepseek");
+  });
+
+  it("throws when CODE2WIKI_LLM_BACKEND=deepseek but DEEPSEEK_API_KEY is missing", () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "deepseek");
+    expect(() => resolveBackend(CONFIG)).toThrow(/DEEPSEEK_API_KEY/);
+  });
+
+  it("returns 'deepseek' when config.llmBackend=deepseek and DEEPSEEK_API_KEY is set", () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "sk-ds-test-456");
+    expect(resolveBackend({ ...CONFIG, llmBackend: "deepseek" })).toBe("deepseek");
+  });
+
+  it("throws when config.llmBackend=deepseek but DEEPSEEK_API_KEY is missing (error mentions config.json)", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    expect(() =>
+      resolveBackend({ ...CONFIG, llmBackend: "deepseek" }),
+    ).toThrow(/code2wiki\.config\.json/);
+  });
+
+  it("auto-detects deepseek when DEEPSEEK_API_KEY is set (beats anthropic)", () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "sk-ds-test-789");
+    // ANTHROPIC_API_KEY is also set (default in beforeEach), but DeepSeek wins.
+    expect(resolveBackend(CONFIG)).toBe("deepseek");
+  });
+
+  it("auto-detects anthropic when only ANTHROPIC_API_KEY is set (no DeepSeek key)", () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "");
+    expect(resolveBackend(CONFIG)).toBe("anthropic");
+  });
+
+  it("CODE2WIKI_LLM_BACKEND=deepseek env var overrides config.llmBackend=anthropic", () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "deepseek");
+    vi.stubEnv("DEEPSEEK_API_KEY", "sk-ds-test-101");
+    expect(resolveBackend({ ...CONFIG, llmBackend: "anthropic" })).toBe("deepseek");
+  });
+
+  it("typo guard error message mentions deepseek in the valid list", () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "dipseek"); // typo
+    try {
+      resolveBackend(CONFIG);
+      expect.fail("expected throw");
+    } catch (e) {
+      expect((e as Error).message).toMatch(/deepseek/);
+    }
+  });
 });
 
-// ── Azure OpenAI extraction ───────────────────────────────────────────────────
+// ── DeepSeek extraction ──────────────────────────────────────────────────────
+
+describe("extractWithLLM: DeepSeek backend", () => {
+  const DS_CONFIG: Config = { ...CONFIG, mock: false, llmBackend: "deepseek" };
+
+  beforeEach(() => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "deepseek");
+    vi.stubEnv("DEEPSEEK_API_KEY", "sk-ds-test-999");
+    vi.stubEnv("DEEPSEEK_BASE_URL", "");
+    vi.stubEnv("DEEPSEEK_MODEL", "");
+  });
+
+  it("routes to DeepSeek when CODE2WIKI_LLM_BACKEND=deepseek", async () => {
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse(`{"ok":true}`));
+    const result = await extractWithLLM({
+      candidate: CANDIDATE,
+      projectName: "demo",
+      config: CONFIG,
+    });
+    expect(result).toEqual({ ok: true });
+    expect(deepseekOpenAICtor).toHaveBeenCalledTimes(1);
+    expect(anthropicCtor).not.toHaveBeenCalled();
+    expect(azureOpenAICtor).not.toHaveBeenCalled();
+  });
+
+  it("instantiates OpenAI with apiKey and default baseURL from env", async () => {
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: DS_CONFIG });
+    expect(deepseekOpenAICtor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: "sk-ds-test-999",
+        baseURL: "https://api.deepseek.com",
+      }),
+    );
+  });
+
+  it("honors DEEPSEEK_BASE_URL override", async () => {
+    vi.stubEnv("DEEPSEEK_BASE_URL", "https://custom.deepseek.com");
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: DS_CONFIG });
+    expect(deepseekOpenAICtor).toHaveBeenCalledWith(
+      expect.objectContaining({ baseURL: "https://custom.deepseek.com" }),
+    );
+  });
+
+  it("uses DEEPSEEK_MODEL when set, else defaults to deepseek-v4-flash", async () => {
+    // Explicit DEEPSEEK_MODEL
+    vi.stubEnv("DEEPSEEK_MODEL", "deepseek-reasoner");
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: DS_CONFIG });
+    expect(deepseekChatCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "deepseek-reasoner" }),
+    );
+
+    // Falls back to default (config.model is NOT consulted; it is an Anthropic model name)
+    vi.stubEnv("DEEPSEEK_MODEL", "");
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({
+      candidate: CANDIDATE,
+      projectName: "demo",
+      config: { ...DS_CONFIG, model: "claude-sonnet-4-6" },
+    });
+    expect(deepseekChatCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "deepseek-v4-flash" }),
+    );
+  });
+
+  it("sends SYSTEM_PROMPT as role='system' message", async () => {
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: DS_CONFIG });
+    const call = deepseekChatCreate.mock.calls[0]?.[0] as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(call.messages[0]).toEqual({ role: "system", content: SYSTEM_PROMPT });
+  });
+
+  it("sends buildUserPrompt content as role='user' message", async () => {
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: DS_CONFIG });
+    const call = deepseekChatCreate.mock.calls[0]?.[0] as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(call.messages[1]).toEqual({
+      role: "user",
+      content: buildUserPrompt(CANDIDATE, "demo"),
+    });
+  });
+
+  it("appends retryHint after separator on DeepSeek path", async () => {
+    const hint = "VALIDATOR: title is empty";
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({
+      candidate: CANDIDATE,
+      projectName: "demo",
+      config: DS_CONFIG,
+      retryHint: hint,
+    });
+    const call = deepseekChatCreate.mock.calls[0]?.[0] as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    const base = buildUserPrompt(CANDIDATE, "demo");
+    expect(call.messages[1]?.content).toBe(`${base}
+
+---
+
+${hint}`);
+  });
+
+  it("parses JSON from DeepSeek chat completion response (strips code fence)", async () => {
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse("```json\n{\"k\":\"v\"}\n```"));
+    const result = await extractWithLLM({
+      candidate: CANDIDATE,
+      projectName: "demo",
+      config: DS_CONFIG,
+    });
+    expect(result).toEqual({ k: "v" });
+  });
+
+  it("mock mode overrides DeepSeek when CODE2WIKI_MOCK=1", async () => {
+    vi.stubEnv("CODE2WIKI_MOCK", "1");
+    const result = (await extractWithLLM({
+      candidate: CANDIDATE,
+      projectName: "demo",
+      config: DS_CONFIG,
+    })) as Record<string, unknown>;
+    expect(result["tags"]).toContain("mock-output");
+    expect(deepseekOpenAICtor).not.toHaveBeenCalled();
+    expect(anthropicCtor).not.toHaveBeenCalled();
+  });
+
+  it("pins max_tokens=4096 (cost guardrail, matching Anthropic path)", async () => {
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: DS_CONFIG });
+    expect(deepseekChatCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ max_tokens: 4096 }),
+    );
+  });
+
+  it("never invokes Anthropic or Azure SDK when on DeepSeek path", async () => {
+    deepseekChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: DS_CONFIG });
+    expect(anthropicCtor).not.toHaveBeenCalled();
+    expect(azureOpenAICtor).not.toHaveBeenCalled();
+  });
+
+  it("throws a length-cap diagnostic when finish_reason='length' and content is empty", async () => {
+    deepseekChatCreate.mockResolvedValueOnce({
+      choices: [{ message: { content: "" }, finish_reason: "length" }],
+    });
+    await expect(
+      extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: DS_CONFIG }),
+    ).rejects.toThrow(/DeepSeek returned empty content.*finish_reason=length/);
+  });
+});
+
+// ── Azure OpenAI extraction
 
 describe("extractWithLLM: Azure OpenAI backend", () => {
   const AZURE_CONFIG: Config = { ...CONFIG, mock: false, llmBackend: "azure-openai" };
@@ -780,6 +1079,40 @@ describe("extractWithLLM: Azure OpenAI backend", () => {
     );
   });
 
+  it("rejects a non-numeric AZURE_OPENAI_MAX_COMPLETION_TOKENS with an actionable error (never reaches the API as NaN)", async () => {
+    // Without the resolveMaxCompletionTokens guard, "16k" / "16,384" / "4O96"
+    // coerce to NaN via Number() and were passed straight to the Azure API,
+    // surfacing as an opaque 400. Pin the fail-fast: a typo throws before the
+    // client is ever called.
+    for (const bad of ["16k", "16,384", "4O96"]) {
+      vi.stubEnv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", bad);
+      await expect(
+        extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG }),
+      ).rejects.toThrow(/AZURE_OPENAI_MAX_COMPLETION_TOKENS must be a positive integer/);
+    }
+    expect(azureChatCreate).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-positive or fractional AZURE_OPENAI_MAX_COMPLETION_TOKENS (0, negative, decimal)", async () => {
+    for (const bad of ["0", "-100", "4096.5"]) {
+      vi.stubEnv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", bad);
+      await expect(
+        extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG }),
+      ).rejects.toThrow(/positive integer; got "/);
+    }
+    expect(azureChatCreate).not.toHaveBeenCalled();
+  });
+
+  it("tolerates surrounding whitespace in AZURE_OPENAI_MAX_COMPLETION_TOKENS", async () => {
+    // Number() trims, so a stray-space value should be accepted, not rejected.
+    vi.stubEnv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "  8000  ");
+    azureChatCreate.mockResolvedValueOnce(chatResponse(`{}`));
+    await extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG });
+    expect(azureChatCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ max_completion_tokens: 8000 }),
+    );
+  });
+
   it("throws a length-cap diagnostic when finish_reason='length' and content is empty (o-series CoT exhausted budget)", async () => {
     azureChatCreate.mockResolvedValueOnce({
       choices: [{ message: { content: "" }, finish_reason: "length" }],
@@ -804,7 +1137,31 @@ describe("extractWithLLM: Azure OpenAI backend", () => {
   });
 });
 
-// ── countTokens with Azure backend ───────────────────────────────────────────
+// ── countTokens with DeepSeek backend ─────────────────────────────────────────
+
+describe("countTokens: DeepSeek backend throws clearly", () => {
+  it("throws with a clear message when DeepSeek backend is selected", async () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "deepseek");
+    vi.stubEnv("DEEPSEEK_API_KEY", "sk-ds-test");
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    await expect(
+      countTokens({ candidate: CANDIDATE, projectName: "demo", config: CONFIG }),
+    ).rejects.toThrow(/estimate-cost.*not supported.*DeepSeek/i);
+    expect(anthropicCtor).not.toHaveBeenCalled();
+    expect(deepseekOpenAICtor).not.toHaveBeenCalled();
+  });
+
+  it("throws with actionable guidance about switching to Anthropic", async () => {
+    vi.stubEnv("CODE2WIKI_LLM_BACKEND", "deepseek");
+    vi.stubEnv("DEEPSEEK_API_KEY", "sk-ds-test");
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+    await expect(
+      countTokens({ candidate: CANDIDATE, projectName: "demo", config: CONFIG }),
+    ).rejects.toThrow(/ANTHROPIC_API_KEY/);
+  });
+});
+
+// ── countTokens with Azure backend
 
 describe("countTokens: Azure backend throws clearly", () => {
   it("throws with a clear message when Azure backend is selected", async () => {

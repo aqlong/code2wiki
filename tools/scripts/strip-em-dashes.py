@@ -52,11 +52,24 @@ SKIP_PATH_FRAGMENTS = (
     # mechanism for the bot would let any operator running the script
     # bypass the bot-self-mod rule with a 1-char "policy compliance" edit.
     "/tools/ocean-bot/",
+    # This scrubber and its test contain the em-dash character by design
+    # (match constants + test fixtures); scanning them always self-flags.
+    "/tools/scripts/strip-em-dashes.py",
+    "/tools/scripts/strip-em-dashes.test.py",
 )
 
 
 def should_skip(p: Path) -> bool:
-    s = str(p).replace("\\", "/")
+    # Match against the path RELATIVE to the repo root, never the absolute
+    # path. When the repo root itself lives under a skip fragment (a git
+    # worktree at ~/code2wiki/.claude/worktrees/<name>/ is the live case),
+    # absolute-path matching skips EVERY file and the check passes
+    # vacuously ("0 em dashes found across 0 files").
+    try:
+        rel = p.resolve().relative_to(REPO_ROOT.resolve())
+    except ValueError:
+        rel = p
+    s = "/" + str(rel).replace("\\", "/")
     return any(frag in s for frag in SKIP_PATH_FRAGMENTS)
 
 
@@ -138,6 +151,9 @@ def main() -> int:
             "*.yaml",
             "*.toml",
             "*.sh",
+            "*.py",
+            "*.example",
+            "*.json",
         )
         for p in REPO_ROOT.rglob(pattern)
         if not should_skip(p)

@@ -9,6 +9,7 @@ import { appendAuditEntry, hashContent, loadSigningKey, type SigningInput } from
 import { PROMPT_VERSION } from "../../core/llm/prompts.js";
 import {
   countTokens as defaultCountTokens,
+  resolveBackend,
   type CountTokensFn,
 } from "../../core/llm/client.js";
 import {
@@ -61,12 +62,56 @@ function meetsConfidenceThreshold(
 }
 
 export async function runGenerate(opts: GenerateOptions): Promise<void> {
+  // Validate --min-confidence at the boundary. The CLI layer (cli/index.ts)
+  // casts the raw flag string straight to the union type with no runtime
+  // check, and meetsConfidenceThreshold resolves an unknown threshold to
+  // minLevel=1 (= "low" = write EVERYTHING). So a typo or wrong-case value
+  // (`--min-confidence HIGH`, `hgih`) would SILENTLY write every page instead
+  // of gating, the exact silent-degradation an auditor-minded operator runs
+  // this flag to prevent. Fail loud instead. Own-property check so values
+  // that exist only on Object.prototype (`constructor`, `toString`) are also
+  // rejected. Validated here (not only in commander) so the programmatic
+  // worker/dashboard call path is protected too.
+  if (
+    opts.minConfidence !== undefined &&
+    !Object.prototype.hasOwnProperty.call(CONFIDENCE_ORDER, opts.minConfidence)
+  ) {
+    throw new Error(
+      `Invalid --min-confidence "${opts.minConfidence}". Expected one of: ${Object.keys(
+        CONFIDENCE_ORDER,
+      ).join(", ")}.`,
+    );
+  }
+
   const config = await loadConfig(opts.cwd);
   if (opts.mock) config.mock = true;
   if (opts.limit && opts.limit > 0) config.maxCandidates = opts.limit;
 
   const projectName = path.basename(opts.cwd);
   let candidates = await scanProject(opts.cwd, config);
+
+
+  // of their sibling code-behind files so the LLM receives both halves. Runs
+  // before any filter so code-behind candidates aren't lost if --only / --name
+
+  // First-run friction guard: when the scan yields zero candidates we used to
+  // fall through to a terse "No candidates to process." and exit, which on a
+  // wrong --cwd is indistinguishable from "tool is broken." Print WHERE we
+  // looked, WHAT extensions we look for, and WHAT TO TRY next. Stderr so any
+  // future stdout contract stays clean; exit 0 so CI regen workflows that
+  // legitimately run against docs-only commits still no-op cleanly.
+  if (candidates.length === 0) {
+    console.warn(
+      [
+        `[code2wiki] No parseable source files found in ${opts.cwd}.`,
+        `[code2wiki] Supported languages: Java, CFML (.cfc / .cfm), Ruby (Rails controllers).`,
+        `[code2wiki] Looked for files matching these patterns (code2wiki.config.json -> include[]):`,
+        ...config.include.map((p) => `[code2wiki]   ${p}`),
+        `[code2wiki] Hint: point --cwd at the application source root, or extend include[] in code2wiki.config.json.`,
+      ].join("\n"),
+    );
+    return;
+  }
 
   let work = candidates;
   if (opts.only) {
@@ -115,15 +160,45 @@ export async function runGenerate(opts: GenerateOptions): Promise<void> {
   }
 
   if (work.length === 0) {
-    console.log("No candidates to process.");
+    // Candidates WERE found by the scan (we cleared the zero-scan guard
+    // above), but the active --only / --name / --since filters excluded
+    // every one. The terse "No candidates to process." that used to print
+    // here read as "the tool is broken" to a prospect who simply mistyped a
+    // filter value -- the same first-run friction the post-scan guard fixes.
+    // Name how many candidates existed pre-filter and which filters are
+    // active so the typo is obvious. Stderr keeps any stdout contract clean.
+    const activeFilters: string[] = [];
+    if (opts.only) activeFilters.push(`--only ${opts.only}`);
+    if (opts.name) activeFilters.push(`--name ${opts.name}`);
+    if (opts.since) activeFilters.push(`--since ${opts.since}`);
+    const filterDesc =
+      activeFilters.length > 0 ? activeFilters.join(", ") : "the active filters";
+    // --only / --name take a user-typed needle, so a mistype is the most
+    // likely cause and "check for a typo" is the right nudge. --since is
+    // different: it is the diff-aware release-regen path (the core
+    // auto-publish-on-every-release flow), and zero documentable candidates
+    // changed since a ref is the NORMAL outcome of a release that did not
+    // touch documented code, NOT an error. Suggest "typo" only when a needle
+    // filter is active; frame a --since-only miss as the benign no-op it is.
+    const hasNeedleFilter = Boolean(opts.only || opts.name);
+    const hint = hasNeedleFilter
+      ? `Hint: check the filter value for a typo, or drop the filter to generate all ${candidates.length} candidate(s).`
+      : `Hint: this is expected when no documentable code changed since ${opts.since}; nothing to regenerate. Drop --since to generate all ${candidates.length} candidate(s).`;
+    console.warn(
+      [
+        `[code2wiki] Found ${candidates.length} candidate(s) in ${opts.cwd}, but ${filterDesc} matched none of them.`,
+        `[code2wiki] ${hint}`,
+      ].join("\n"),
+    );
     return;
   }
 
   // --estimate-cost: project the run's input + output token cost and
   // exit BEFORE any LLM call or filesystem write. Placed here (after
-  // scan + filters + maxCandidates cap, before mkdir/audit-write) so
-  // the estimate matches exactly what the same flag-set would actually
-  // bill, and so dry-runs leave zero side effects on disk.
+  // scan + filters + maxCandidates cap + dependency resolution, before
+  // mkdir/audit-write) so the estimate matches exactly what the same
+  // flag-set would actually bill, and so dry-runs leave zero side
+  // effects on disk.
   if (opts.estimateCost) {
     const countTokensFn = opts.countTokensFn ?? defaultCountTokens;
     console.log(
@@ -162,17 +237,14 @@ export async function runGenerate(opts: GenerateOptions): Promise<void> {
 
   await fs.mkdir(path.join(opts.cwd, config.output), { recursive: true });
 
-  const usingMock =
-    config.mock ||
-    process.env["CODE2WIKI_MOCK"] === "1" ||
-    (!process.env["ANTHROPIC_API_KEY"] &&
-      (!process.env["AZURE_OPENAI_API_KEY"] || !process.env["AZURE_OPENAI_ENDPOINT"]));
-
+  const backend = resolveBackend(config);
+  const usingMock = backend === "mock";
   const backendLabel =
-    !usingMock && (process.env["CODE2WIKI_LLM_BACKEND"] === "azure-openai" ||
-      (process.env["AZURE_OPENAI_API_KEY"] && !process.env["ANTHROPIC_API_KEY"]))
-      ? `Azure OpenAI (${process.env["AZURE_OPENAI_DEPLOYMENT"] || config.model})`
-      : config.model;
+    backend === "azure-openai"
+      ? `Azure OpenAI (${process.env["AZURE_OPENAI_DEPLOYMENT"] || "gpt-4o"})`
+      : backend === "deepseek"
+        ? `DeepSeek (${process.env["DEEPSEEK_MODEL"] || "deepseek-v4-flash"})`
+        : config.model;
 
   console.log(
     `[code2wiki] Generating ${work.length} use case(s)${usingMock ? " (MOCK MODE, no LLM call)" : ` via ${backendLabel}`}...`,

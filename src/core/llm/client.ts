@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { AzureOpenAI } from "openai";
+import OpenAI, { AzureOpenAI } from "openai";
 import type { Candidate, Config } from "../types.js";
 import { SYSTEM_PROMPT, buildUserPrompt } from "./prompts.js";
 import { mockExtract } from "./mock.js";
@@ -21,41 +21,67 @@ export interface ExtractOptions {
 
 // ── Backend detection ────────────────────────────────────────────────────────
 
-export type LLMBackend = "anthropic" | "azure-openai" | "mock";
+export type LLMBackend = "anthropic" | "azure-openai" | "deepseek" | "mock";
 
 /**
  * Resolve which LLM backend to use for this call.
  *
  * Priority order (highest first):
  *   1. Mock: config.mock=true OR CODE2WIKI_MOCK=1 → always mock, no LLM.
- *   2. CODE2WIKI_LLM_BACKEND env var ('anthropic' | 'azure-openai').
- *   3. config.llmBackend ('anthropic' | 'azure-openai').
+ *   2. CODE2WIKI_LLM_BACKEND env var ('deepseek' | 'anthropic' | 'azure-openai').
+ *   3. config.llmBackend ('deepseek' | 'anthropic' | 'azure-openai').
  *   4. Auto-detect:
- *      - Azure if AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT are set
- *        and ANTHROPIC_API_KEY is absent.
+ *      - DeepSeek if DEEPSEEK_API_KEY is set.
  *      - Anthropic if ANTHROPIC_API_KEY is set.
- *      - Mock if neither is present (zero-cost smoke-test path).
+ *      - Azure if AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT are set.
+ *      - Mock if none are present (zero-cost smoke-test path).
  */
 export function resolveBackend(config: Config): LLMBackend {
   if (config.mock || process.env["CODE2WIKI_MOCK"] === "1") return "mock";
 
   const envOverride = process.env["CODE2WIKI_LLM_BACKEND"];
+  if (envOverride === "deepseek") return validateDeepseekEnv();
   if (envOverride === "azure-openai") return validateAzureEnv();
   if (envOverride === "anthropic") return "anthropic";
+  // "auto" and unset/empty fall through to config + auto-detect below. Any
+  // OTHER non-empty value is a typo (e.g. "azure" for "azure-openai") that
+  // would otherwise be silently ignored, routing to whatever auto-detect
+  // picks (often the wrong provider on the wrong bill, the exact opposite of
+  // the operator's explicit intent). Fail fast with an actionable error,
+  // matching the discipline of validateAzureEnv + resolveMaxCompletionTokens.
+  if (envOverride && envOverride !== "auto") {
+    throw new Error(
+      `CODE2WIKI_LLM_BACKEND must be one of: deepseek, anthropic, azure-openai, auto (or unset); got "${envOverride}". ` +
+        "Unset it to auto-detect the backend from the available API keys.",
+    );
+  }
 
   const cfgBackend = config.llmBackend ?? "auto";
+  if (cfgBackend === "deepseek") return validateDeepseekEnv();
   if (cfgBackend === "azure-openai") return validateAzureEnv();
   if (cfgBackend === "anthropic") return "anthropic";
 
-  // Auto-detect.
+  // Auto-detect: DeepSeek wins when DEEPSEEK_API_KEY is set.
+  const hasDeepSeek = !!process.env["DEEPSEEK_API_KEY"];
+  const hasAnthropic = !!process.env["ANTHROPIC_API_KEY"];
   const hasAzure =
     !!process.env["AZURE_OPENAI_API_KEY"] &&
     !!process.env["AZURE_OPENAI_ENDPOINT"];
-  const hasAnthropic = !!process.env["ANTHROPIC_API_KEY"];
 
-  if (hasAzure && !hasAnthropic) return "azure-openai";
+  if (hasDeepSeek) return "deepseek";
   if (hasAnthropic) return "anthropic";
+  if (hasAzure) return "azure-openai";
   return "mock";
+}
+
+function validateDeepseekEnv(): "deepseek" {
+  if (!process.env["DEEPSEEK_API_KEY"]) {
+    throw new Error(
+      "DeepSeek backend selected but DEEPSEEK_API_KEY is missing. " +
+        "Set it and re-run, or let code2wiki auto-detect by clearing CODE2WIKI_LLM_BACKEND and removing llmBackend from your code2wiki.config.json.",
+    );
+  }
+  return "deepseek";
 }
 
 function validateAzureEnv(): "azure-openai" {
@@ -65,10 +91,56 @@ function validateAzureEnv(): "azure-openai" {
   if (missing.length > 0) {
     throw new Error(
       `Azure OpenAI backend selected but the following env vars are missing: ${missing.join(", ")}. ` +
-        "Set them and re-run, or remove CODE2WIKI_LLM_BACKEND to let code2wiki auto-detect.",
+        "Set them and re-run, or let code2wiki auto-detect by clearing CODE2WIKI_LLM_BACKEND and removing llmBackend from your code2wiki.config.json.",
     );
   }
   return "azure-openai";
+}
+
+// ── DeepSeek extraction ──────────────────────────────────────────────────────
+
+async function extractWithDeepseek(
+  userPrompt: string,
+  _config: Config,
+): Promise<unknown> {
+  const apiKey = process.env["DEEPSEEK_API_KEY"];
+  if (!apiKey) {
+    throw new Error(
+      "extractWithDeepseek requires DEEPSEEK_API_KEY. " +
+        "Use extractWithLLM() instead of calling this directly so backend selection is consistent.",
+    );
+  }
+
+  const baseURL =
+    process.env["DEEPSEEK_BASE_URL"] || "https://api.deepseek.com";
+  const model =
+    process.env["DEEPSEEK_MODEL"] || "deepseek-v4-flash";
+
+  const client = new OpenAI({ baseURL, apiKey });
+
+  const response = await client.chat.completions.create({
+    model,
+    max_tokens: 4096,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userPrompt },
+    ],
+  });
+
+  const text = response.choices[0]?.message?.content ?? "";
+  const finishReason = response.choices[0]?.finish_reason;
+  const refusal = (response.choices[0]?.message as { refusal?: string })?.refusal;
+
+  if (!text) {
+    const detail = refusal
+      ? `Model refused: ${refusal}`
+      : finishReason === "length"
+        ? `finish_reason=length: the model exhausted its max_tokens budget (4096) before emitting any visible output. This usually means the file is too large for the model's context window. Try a smaller file or a tighter focus region.`
+        : `finish_reason=${finishReason ?? "unknown"}.`;
+    throw new Error(`DeepSeek returned empty content. ${detail}`);
+  }
+
+  return parseJsonObject(text);
 }
 
 // ── Azure OpenAI extraction ──────────────────────────────────────────────────
@@ -83,6 +155,30 @@ function validateAzureEnv(): "azure-openai" {
  * path).
  */
 const AZURE_DEFAULT_MAX_COMPLETION_TOKENS = 16384;
+
+/**
+ * Parse the AZURE_OPENAI_MAX_COMPLETION_TOKENS override into a positive
+ * integer, or fall back to the default when it is unset/empty.
+ *
+ * Without this guard a typo'd value (e.g. "16k", "16,384", "4O96") coerces to
+ * NaN via Number() and was passed straight to the Azure API, surfacing as an
+ * opaque 400 instead of an actionable config error; "0" / "-100" / "4096.5"
+ * are likewise rejected by the API but only after a round trip. This keeps the
+ * same fail-fast, actionable-error discipline as validateAzureEnv. Number()
+ * trims surrounding whitespace, so "  8000  " is still accepted.
+ */
+function resolveMaxCompletionTokens(raw: string | undefined): number {
+  if (!raw) return AZURE_DEFAULT_MAX_COMPLETION_TOKENS;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(
+      `AZURE_OPENAI_MAX_COMPLETION_TOKENS must be a positive integer; got "${raw}". ` +
+        `Remove it to use the default (${AZURE_DEFAULT_MAX_COMPLETION_TOKENS}), ` +
+        "or set it to a whole number of tokens (e.g. 4096).",
+    );
+  }
+  return n;
+}
 
 async function extractWithAzure(
   userPrompt: string,
@@ -108,10 +204,10 @@ async function extractWithAzure(
 
   // Configurable completion budget. Reasoning models burn most of it on
   // invisible CoT; standard models barely touch it. Default sized for the
-  // reasoning case.
-  const maxCompletionTokens = Number(
-    process.env["AZURE_OPENAI_MAX_COMPLETION_TOKENS"] ||
-      AZURE_DEFAULT_MAX_COMPLETION_TOKENS,
+  // reasoning case. Validated up front so a typo'd value fails with an
+  // actionable error instead of an opaque Azure 400.
+  const maxCompletionTokens = resolveMaxCompletionTokens(
+    process.env["AZURE_OPENAI_MAX_COMPLETION_TOKENS"],
   );
 
   const client = new AzureOpenAI({ apiKey, endpoint, deployment, apiVersion });
@@ -177,6 +273,22 @@ async function extractWithAnthropic(
     .map((block) => (block.type === "text" ? block.text : ""))
     .join("");
 
+  // Empty-content guard, mirroring the Azure path's diagnostic discipline.
+  // Without it a truncated (max_tokens) or refused response falls through to
+  // parseJsonObject(""), which throws the generic "did not return valid JSON.
+  // First 200 chars:" with an empty snippet, hiding the actual cause. The
+  // stop_reason names the failure mode so the operator can act on it.
+  if (!text) {
+    const stopReason = response.stop_reason;
+    const detail =
+      stopReason === "refusal"
+        ? "stop_reason=refusal: the model declined to generate output for this input (safety system)."
+        : stopReason === "max_tokens"
+          ? "stop_reason=max_tokens: the model exhausted its max_tokens budget (4096) before emitting any visible text. This usually means the file is too large for the model's context window. Try a smaller file or a tighter focus region."
+          : `stop_reason=${stopReason ?? "unknown"}.`;
+    throw new Error(`Anthropic returned empty content. ${detail}`);
+  }
+
   return parseJsonObject(text);
 }
 
@@ -189,9 +301,9 @@ async function extractWithAnthropic(
  *
  * Backend selection: see resolveBackend(). Short version:
  *   - Mock by default (no keys needed).
- *   - Azure OpenAI when AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT are set
- *     (or CODE2WIKI_LLM_BACKEND=azure-openai / config.llmBackend=azure-openai).
- *   - Anthropic when ANTHROPIC_API_KEY is set and Azure is not selected.
+ *   - DeepSeek when DEEPSEEK_API_KEY is set.
+ *   - Anthropic when ANTHROPIC_API_KEY is set (and DeepSeek not selected).
+ *   - Azure OpenAI when AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT are set.
  */
 export async function extractWithLLM(
   opts: ExtractOptions,
@@ -207,6 +319,10 @@ export async function extractWithLLM(
     ? `${baseUserPrompt}\n\n---\n\n${opts.retryHint}`
     : baseUserPrompt;
 
+  if (backend === "deepseek") {
+    return extractWithDeepseek(userPrompt, opts.config);
+  }
+
   if (backend === "azure-openai") {
     return extractWithAzure(userPrompt, opts.config);
   }
@@ -221,9 +337,9 @@ export async function extractWithLLM(
  * cache_control: ephemeral in extractWithLLM, user does not), so the
  * cost helper applies the 50% cache discount only to systemTokens.
  *
- * NOTE: Azure OpenAI does not provide a non-billed token-counting endpoint
- * equivalent to Anthropic's messages.countTokens. When the Azure backend is
- * active, --estimate-cost is unsupported and this function throws a clear
+ * NOTE: Neither DeepSeek nor Azure OpenAI provide a non-billed token-counting
+ * endpoint equivalent to Anthropic's messages.countTokens. When either backend
+ * is active, --estimate-cost is unsupported and this function throws a clear
  * error.
  *
  * Cost: the messages.countTokens endpoint is non-billed (Anthropic
@@ -250,6 +366,14 @@ export type CountTokensFn = (opts: {
 
 export const countTokens: CountTokensFn = async (opts) => {
   const backend = resolveBackend(opts.config);
+  if (backend === "deepseek") {
+    throw new Error(
+      "--estimate-cost is not supported with the DeepSeek backend. " +
+        "DeepSeek does not expose a non-billed token-counting endpoint. " +
+        "Remove DEEPSEEK_API_KEY (or set CODE2WIKI_LLM_BACKEND=anthropic) " +
+        "and set ANTHROPIC_API_KEY to use the cost-estimation feature.",
+    );
+  }
   if (backend === "azure-openai") {
     throw new Error(
       "--estimate-cost is not supported with the Azure OpenAI backend. " +

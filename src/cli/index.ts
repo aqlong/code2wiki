@@ -15,17 +15,18 @@ import { runPreview } from "./commands/preview.js";
 // formats like `export FOO=bar` that Node's --env-file rejects).
 loadProjectEnv(process.cwd());
 
-const program = new Command();
+export function getProgram(): Command {
+  const program = new Command();
 
-program
-  .name("code2wiki")
-  .description(
-    "Generate non-technical, use-case-style wiki pages from source code",
-  )
-  .version("0.1.0");
+  program
+    .name("code2wiki")
+    .description(
+      "Generate non-technical, use-case-style wiki pages from source code",
+    )
+    .version("0.1.0");
 
-program
-  .command("init")
+  program
+    .command("init")
   .description("Create a default code2wiki.config.json")
   .option("--cwd <dir>", "Project root", process.cwd())
   .action(async (opts: { cwd: string }) => {
@@ -53,7 +54,7 @@ program
   .option("--only <substring>", "Only include candidates whose path matches")
   .option("--name <name>", "Only include the candidate with this exact function/method name (suffix match, e.g. 'publish' or 'OwnerController.processCreationForm')")
   .option("--since <ref>", "Only regenerate candidates whose source files changed since this git ref (e.g. 'HEAD~1', 'main', 'origin/main', or 'uncommitted')")
-  .option("--estimate-cost", "Project token + USD cost via anthropic.messages.countTokens (non-billed) and exit without LLM calls. Requires ANTHROPIC_API_KEY.", false)
+  .option("--estimate-cost", "Project token + USD cost estimate via Anthropic messages.countTokens (non-billed) and exit without LLM calls. Requires ANTHROPIC_API_KEY. Not available on DeepSeek or Azure OpenAI backends.", false)
   .option(
     "--min-confidence <level>",
     "Skip writing pages whose LLM-rated confidence is below this level. One of: high, medium, low (default: low = write everything).",
@@ -237,4 +238,11 @@ program
     },
   );
 
-await program.parseAsync(process.argv);
+  return program;
+}
+
+// Only parse arguments if this is the main entry point (not being imported by tests)
+if (process.argv[1]?.endsWith("cli/index.js") || process.argv[1]?.endsWith("cli/index.ts")) {
+  const program = getProgram();
+  await program.parseAsync(process.argv);
+}

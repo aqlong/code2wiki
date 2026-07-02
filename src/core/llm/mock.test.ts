@@ -45,7 +45,8 @@ describe("mockExtract", () => {
   });
 
   it("explains how to enable real extraction in the summary", () => {
-    expect(String(result["summary"])).toMatch(/ANTHROPIC_API_KEY/);
+    const summary = String(result["summary"]);
+    expect(summary).toMatch(/ANTHROPIC_API_KEY|DEEPSEEK_API_KEY/);
   });
 
   it("surfaces parser-detected database tables as raw business rules", () => {
