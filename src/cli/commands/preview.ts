@@ -315,6 +315,8 @@ function bannerHtml(banner: BannerInputs): string {
  * Also scans the rendered document body for bare ISO-8601 UTC timestamps
  * (produced by the LLM in YAML frontmatter rendering or footers) and
  * localizes them too, so reviewers never see raw `2026-06-01T15:09:22.047Z`.
+ * Text inside <code>/<pre> is exempt: code samples (example payloads,
+ * fixture JSON) must display exactly what the source shows.
  */
 const LOCALIZE_TIME_SCRIPT = `<script>
 (function(){
@@ -349,6 +351,7 @@ const LOCALIZE_TIME_SCRIPT = `<script>
     var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, null);
     var nodes = [], n;
     while ((n = walker.nextNode())) {
+      if (n.parentElement && n.parentElement.closest("code,pre")) continue;
       if (isoRe.test(n.nodeValue)) { isoRe.lastIndex = 0; nodes.push(n); }
     }
     nodes.forEach(function(node){

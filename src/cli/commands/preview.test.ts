@@ -781,4 +781,195 @@ Bare root file.
     expect(idxHtml).toMatch(/<h2>\(root\) <span class="count">\(1\)<\/span><\/h2>/);
     expect(idxHtml).toContain(`href="bare/confluence.html"`);
   });
+
+  // Structural pin for the grouping: every page's link must sit inside
+  // its OWN group's section, i.e. between its group's <h2> and the next
+  // <h2>. The counts test above can't catch a regression that renders
+  // correct headers but dumps every <li> under the first group's <ul>.
+  it("nests each page's link inside its own group section, not a sibling's", async () => {
+    const outDir = path.join(dir, "docs", "use-cases");
+    await fs.mkdir(outDir, { recursive: true });
+    const groupedPage = (folder: string, slug: string, title: string): string => `---
+code2wiki_id: ${slug}-v1
+title: ${title}
+slug: ${slug}
+actor: An internal application caller
+status: active
+last_generated: 2026-05-13T00:00:00Z
+last_commit: 0000000
+confidence: high
+source_files:
+  - path: ${folder}/${slug}.cfc
+    lines: 1-3
+tags: []
+---
+
+<!-- code2wiki:managed:start id=${slug}-v1 -->
+
+## Summary
+
+Sample.
+
+<!-- code2wiki:managed:end -->
+`;
+    await fs.writeFile(
+      path.join(outDir, "report-a.md"),
+      groupedPage("Reports", "report-a", "Report A"),
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(outDir, "time-clock.md"),
+      groupedPage("Time", "time-clock", "Time Clock"),
+      "utf-8",
+    );
+    captureConsole();
+
+    await runPreview({ cwd: dir });
+
+    const idxHtml = await fs.readFile(
+      path.join(dir, ".code2wiki", "preview", "index.html"),
+      "utf-8",
+    );
+
+    const reportsH2 = idxHtml.indexOf("<h2>Reports");
+    const timeH2 = idxHtml.indexOf("<h2>Time");
+    const reportLink = idxHtml.indexOf(`href="report-a/confluence.html"`);
+    const timeLink = idxHtml.indexOf(`href="time-clock/confluence.html"`);
+    // Reports link between the Reports h2 and the Time h2; Time link
+    // after the Time h2.
+    expect(reportLink).toBeGreaterThan(reportsH2);
+    expect(reportLink).toBeLessThan(timeH2);
+    expect(timeLink).toBeGreaterThan(timeH2);
+  });
+
+  // Group labels come straight from repo folder names, which are
+  // attacker-ish input: a folder named "<Fees> & Charges" must render
+  // escaped, never as live markup. Windows-style separators must also
+  // split ("Legacy\\win.cfc" groups under "Legacy"), and a page with NO
+  // source_files at all falls back to "(root)" instead of crashing on
+  // the missing array.
+  it("escapes HTML in group names, splits Windows paths, and buckets missing source_files under (root)", async () => {
+    const outDir = path.join(dir, "docs", "use-cases");
+    await fs.mkdir(outDir, { recursive: true });
+    await fs.writeFile(
+      path.join(outDir, "hostile.md"),
+      `---
+code2wiki_id: hostile-v1
+title: Hostile Group
+slug: hostile
+actor: An internal application caller
+status: active
+last_generated: 2026-05-13T00:00:00Z
+last_commit: 0000000
+confidence: high
+source_files:
+  - path: "<Fees> & Charges/hostile.cfc"
+    lines: 1-3
+tags: []
+---
+
+<!-- code2wiki:managed:start id=hostile-v1 -->
+
+## Summary
+
+Sample.
+
+<!-- code2wiki:managed:end -->
+`,
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(outDir, "win.md"),
+      `---
+code2wiki_id: win-v1
+title: Windows Path
+slug: win
+actor: An internal application caller
+status: active
+last_generated: 2026-05-13T00:00:00Z
+last_commit: 0000000
+confidence: high
+source_files:
+  - path: "Legacy\\\\win.cfc"
+    lines: 1-3
+tags: []
+---
+
+<!-- code2wiki:managed:start id=win-v1 -->
+
+## Summary
+
+Sample.
+
+<!-- code2wiki:managed:end -->
+`,
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(outDir, "orphan.md"),
+      `---
+code2wiki_id: orphan-v1
+title: Orphan Page
+slug: orphan
+actor: An internal application caller
+status: active
+last_generated: 2026-05-13T00:00:00Z
+last_commit: 0000000
+confidence: high
+tags: []
+---
+
+<!-- code2wiki:managed:start id=orphan-v1 -->
+
+## Summary
+
+Sample.
+
+<!-- code2wiki:managed:end -->
+`,
+      "utf-8",
+    );
+    captureConsole();
+
+    await runPreview({ cwd: dir });
+
+    const idxHtml = await fs.readFile(
+      path.join(dir, ".code2wiki", "preview", "index.html"),
+      "utf-8",
+    );
+
+    // Escaped, not live markup.
+    expect(idxHtml).toContain("<h2>&lt;Fees&gt; &amp; Charges ");
+    expect(idxHtml).not.toContain("<h2><Fees>");
+    // Backslash separator splits like a forward slash.
+    expect(idxHtml).toMatch(/<h2>Legacy <span class="count">\(1\)<\/span><\/h2>/);
+    // No source_files at all -> "(root)", and the page still renders.
+    expect(idxHtml).toMatch(/<h2>\(root\) <span class="count">\(1\)<\/span><\/h2>/);
+    expect(idxHtml).toContain(`href="orphan/confluence.html"`);
+  });
+
+  // Code samples must display exactly what the source shows: the body
+  // TreeWalker skips text inside <code>/<pre> so an ISO timestamp in an
+  // example payload is NOT rewritten to viewer-local time. Verified
+  // in-browser 2026-07-02 (inline + fenced JSON both stayed literal
+  // only with the closest("code,pre") guard); this pins the guard's
+  // presence in the shipped script.
+  it("localize script exempts code/pre text from the body ISO rewrite", async () => {
+    const outDir = path.join(dir, "docs", "use-cases");
+    await fs.mkdir(outDir, { recursive: true });
+    await fs.writeFile(
+      path.join(outDir, "page-one.md"),
+      SAMPLE_PAGE("page-one", "Page One"),
+      "utf-8",
+    );
+    captureConsole();
+
+    await runPreview({ cwd: dir });
+
+    const cfHtml = await fs.readFile(
+      path.join(dir, ".code2wiki", "preview", "page-one", "confluence.html"),
+      "utf-8",
+    );
+    expect(cfHtml).toContain('closest("code,pre")');
+  });
 });
