@@ -1,0 +1,108 @@
+#
+# code2wiki: regenerate use-case docs on every push (copy-paste template)
+#
+# To wire this into YOUR project:
+#   1. Copy this file to .github/workflows/code2wiki.yml in your repo.
+#   2. Set the ANTHROPIC_API_KEY secret in repo Settings -> Secrets -> Actions
+#      (or leave it unset to run in mock mode for testing; mock runs emit
+#      clearly-marked draft pages so the pipeline still works end to end).
+#   3. Commit a code2wiki.config.json at your project root (run
+#      `code2wiki init` once and commit the result).
+#   4. Point the `paths:` globs below at your application source directories.
+#
+# This template is derived from the dogfood workflow in the upstream
+# monorepo (.github/workflows/code2wiki.yml); a drift guard there keeps the
+# load-bearing pieces of the two files in sync. Differences are deliberate:
+# this template installs code2wiki from GitHub (your repo does not contain
+# its source) and omits the upstream repo's internal PR-summary tooling.
+#
+name: code2wiki, regenerate use-case docs
+
+on:
+  push:
+    branches: [main]
+    # Only regenerate when code that actually affects the generated output
+    # changes. A docs-only or config-only commit does not change what
+    # `code2wiki generate` produces, so running this job (npm ci + build +
+    # generate) on every push wastes Actions minutes. Equally important:
+    # the "Commit changes back" step below pushes refreshed docs/use-cases/
+    # to main, and WITHOUT a path filter that commit re-triggers this
+    # workflow (self-amplifying loop). Scoping the trigger to source paths,
+    # and never listing the generated docs/use-cases/ output here, breaks
+    # the loop. The upstream project learned this the expensive way: an
+    # unfiltered trigger produced 600+ runs a month and exhausted an org's
+    # free Actions minutes (cost incident, 2026-05-28).
+    #
+    # Point these globs at YOUR application source directories.
+    paths:
+      - "src/**"
+  workflow_dispatch:
+
+# At most one regeneration per ref; cancel a superseded in-flight run when
+# a newer commit lands. The diff-aware --since regen already no-ops on a
+# redundant second pass, but canceling avoids the install cost too.
+concurrency:
+  group: code2wiki-regen-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full history so diff-aware regen (--since <sha>) can resolve
+          # the previous commit.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install code2wiki
+        run: |
+          git clone --depth=1 https://github.com/aqlong/code2wiki /tmp/code2wiki
+          cd /tmp/code2wiki
+          npm ci
+          npm run build
+
+      - name: Generate use-case docs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          # Diff-aware regen: only re-process candidates whose source files
+          # changed since the previous commit. On the first push to a branch
+          # (BEFORE_SHA = 0000000...) or on workflow_dispatch (BEFORE_SHA
+          # empty), fall through to a full regeneration.
+          SINCE_FLAG=""
+          if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            if git cat-file -e "$BEFORE_SHA" 2>/dev/null; then
+              SINCE_FLAG="--since $BEFORE_SHA"
+              echo "Diff-aware regen: --since $BEFORE_SHA"
+            else
+              echo "BEFORE_SHA $BEFORE_SHA not in this clone; doing full regen"
+            fi
+          fi
+
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning::ANTHROPIC_API_KEY not set, running in mock mode"
+            node /tmp/code2wiki/dist/cli/index.js generate --mock $SINCE_FLAG
+          else
+            node /tmp/code2wiki/dist/cli/index.js generate $SINCE_FLAG
+          fi
+
+      - name: Commit changes back
+        run: |
+          git config user.name "code2wiki[bot]"
+          git config user.email "code2wiki@users.noreply.github.com"
+          if [ -n "$(git status --porcelain docs/use-cases/)" ]; then
+            git add docs/use-cases/
+            git commit -m "docs: refresh code2wiki use-case docs (auto-update from ${GITHUB_SHA:0:7})"
+            git push
+          else
+            echo "No changes to commit."
+          fi

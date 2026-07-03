@@ -214,13 +214,13 @@ becomes a tamper-evident record of every doc change tied to a commit.
 
 ## Auto-running on every commit
 
-Add a GitHub Actions workflow to your project that, on every push to `main`:
+Copy [`docs/templates/code2wiki.yml`](docs/templates/code2wiki.yml) to `.github/workflows/code2wiki.yml` in your project. On every push to `main`, it:
 
-1. Installs and builds code2wiki
-2. Runs `code2wiki generate` against your repo (set the `ANTHROPIC_API_KEY` secret, or leave it unset and the run falls through to `--mock` with clearly-marked draft pages)
+1. Installs and builds code2wiki from this repository
+2. Runs `code2wiki generate` against your repo, diff-aware (`--since` the previous commit) so unchanged files are skipped (set the `ANTHROPIC_API_KEY` secret, or leave it unset and the run falls through to `--mock` with clearly-marked draft pages)
 3. Commits any updated use-case docs back into `docs/use-cases/`
 
-Scope the workflow's `paths:` trigger to your application source directories and exclude the generated `docs/use-cases/` output, otherwise the commit-back step re-triggers the workflow in a loop. The reference implementation lives at `.github/workflows/code2wiki.yml` in the private monorepo; a copy-paste public template is planned.
+Before enabling it, point the workflow's `paths:` trigger at your application source directories and never list the generated `docs/use-cases/` output there, otherwise the commit-back step re-triggers the workflow in a loop (the template's comments explain the incident that lesson comes from).
 
 ## Architecture
 
