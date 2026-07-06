@@ -241,8 +241,12 @@ program
   return program;
 }
 
-// Only parse arguments if this is the main entry point (not being imported by tests)
-if (process.argv[1]?.endsWith("cli/index.js") || process.argv[1]?.endsWith("cli/index.ts")) {
+// Only parse arguments if this is the main entry point (not being imported by
+// tests). Normalize path separators first: on Windows, process.argv[1] is an
+// absolute path with backslashes (e.g. C:\...\dist\cli\index.js), so a raw
+// endsWith("cli/index.js") check never matches and the CLI silently no-ops.
+const entryPath = process.argv[1]?.replace(/\\/g, "/");
+if (entryPath?.endsWith("cli/index.js") || entryPath?.endsWith("cli/index.ts")) {
   const program = getProgram();
   await program.parseAsync(process.argv);
 }
