@@ -227,6 +227,25 @@ describe("loadConfig, schema passthrough on valid input", () => {
     expect(cfg.exclude).toEqual(["**/skip/**"]);
   });
 
+  // 2026-07-06 real-repo signal: a config written on Windows with PowerShell
+  // 5.1's `Set-Content -Encoding UTF8` prepends a UTF-8 BOM (U+FEFF). Node's
+  // "utf-8" decoder preserves it, so JSON.parse threw an opaque
+  // "Unexpected token '\uFEFF'" and `code2wiki list`/`generate` failed to load
+  // an otherwise-valid config. loadConfig strips a single leading BOM; pin that
+  // a BOM-prefixed file loads and its values survive schema parse.
+  it("tolerates a leading UTF-8 BOM on the config file (Windows Set-Content -Encoding UTF8)", async () => {
+    await writeTopLevel("\uFEFF" + JSON.stringify({ output: "./custom", maxCandidates: 500 }));
+    const cfg = await loadConfig(dir);
+    expect(cfg.output).toBe("./custom");
+    expect(cfg.maxCandidates).toBe(500);
+  });
+
+  it("tolerates a leading BOM on the nested config file too", async () => {
+    await writeNested("\uFEFF" + JSON.stringify({ output: "./nested-bom" }));
+    const cfg = await loadConfig(dir);
+    expect(cfg.output).toBe("./nested-bom");
+  });
+
   it("threads a customer validator.maxMainFlowSteps override through schema parse", async () => {
     // Pins that ConfigSchema.validator is an actual nested-object schema
     // (not a passthrough) and that the customer's value reaches callers
