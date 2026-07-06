@@ -1122,6 +1122,39 @@ describe("extractWithLLM: Azure OpenAI backend", () => {
     ).rejects.toThrow(/finish_reason=length.*AZURE_OPENAI_MAX_COMPLETION_TOKENS/);
   });
 
+  // 2026-07-06 real-repo signal: on a real Sales pass a gpt-5-mini response came
+  // back with partial-but-non-empty JSON (`{ "title": "...", "summary": "...`)
+  // and finish_reason=length — the reasoning budget ran out mid-object. The
+  // empty-content guard didn't fire (content was non-empty), so parseJsonObject
+  // threw the generic "did not return valid JSON. First 200 chars: {" with no
+  // hint that the fix is a larger completion budget. Pin that truncated JSON
+  // with finish_reason=length surfaces the actionable budget guidance instead.
+  it("throws a truncation diagnostic when finish_reason='length' but content is partial JSON", async () => {
+    azureChatCreate.mockResolvedValueOnce({
+      choices: [
+        {
+          message: { content: '{\n  "title": "Generate GSS League Fees Report",\n  "summary": "When a user' },
+          finish_reason: "length",
+        },
+      ],
+    });
+    await expect(
+      extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG }),
+    ).rejects.toThrow(/truncated JSON \(finish_reason=length\).*AZURE_OPENAI_MAX_COMPLETION_TOKENS/);
+  });
+
+  // Guard the other side: a genuinely malformed body with a normal finish
+  // reason (not length) must still surface parseJsonObject's generic error, so
+  // the truncation branch can't swallow ordinary bad-JSON bugs.
+  it("keeps the generic parse error when JSON is invalid but finish_reason is not 'length'", async () => {
+    azureChatCreate.mockResolvedValueOnce({
+      choices: [{ message: { content: "not json at all" }, finish_reason: "stop" }],
+    });
+    await expect(
+      extractWithLLM({ candidate: CANDIDATE, projectName: "demo", config: AZURE_CONFIG }),
+    ).rejects.toThrow(/did not return valid JSON/);
+  });
+
   it("throws a refusal diagnostic when message.refusal is populated (content filter / safety system)", async () => {
     azureChatCreate.mockResolvedValueOnce({
       choices: [
