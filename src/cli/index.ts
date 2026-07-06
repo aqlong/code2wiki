@@ -241,12 +241,29 @@ program
   return program;
 }
 
+/**
+ * True when `argv1` (i.e. process.argv[1]) points at this CLI module, meaning
+ * the file was executed directly — `code2wiki ...` via the npm bin shim,
+ * `node dist/cli/index.js`, or `tsx src/cli/index.ts` — rather than imported
+ * by a test.
+ *
+ * Path separators are normalized first. On Windows, Node sets process.argv[1]
+ * to an absolute path with backslashes (e.g. `C:\...\dist\cli\index.js`), so a
+ * raw `endsWith("cli/index.js")` check never matches and the CLI silently
+ * no-ops (exits 0 doing nothing). That regressed the entire Windows
+ * global-install path documented in the README. See cli/entrypoint.test.ts.
+ */
+export function isCliEntrypoint(argv1: string | undefined): boolean {
+  if (!argv1) return false;
+  const normalized = argv1.replace(/\\/g, "/");
+  return (
+    normalized.endsWith("cli/index.js") || normalized.endsWith("cli/index.ts")
+  );
+}
+
 // Only parse arguments if this is the main entry point (not being imported by
-// tests). Normalize path separators first: on Windows, process.argv[1] is an
-// absolute path with backslashes (e.g. C:\...\dist\cli\index.js), so a raw
-// endsWith("cli/index.js") check never matches and the CLI silently no-ops.
-const entryPath = process.argv[1]?.replace(/\\/g, "/");
-if (entryPath?.endsWith("cli/index.js") || entryPath?.endsWith("cli/index.ts")) {
+// tests).
+if (isCliEntrypoint(process.argv[1])) {
   const program = getProgram();
   await program.parseAsync(process.argv);
 }
