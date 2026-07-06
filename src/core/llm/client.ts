@@ -238,7 +238,25 @@ async function extractWithAzure(
     throw new Error(`Azure OpenAI returned empty content. ${detail}`);
   }
 
-  return parseJsonObject(text);
+  // A non-empty body can still be unparseable when the model was cut off
+  // mid-JSON at the completion budget. The empty-content guard above only
+  // catches the zero-visible-output case; here we have partial JSON. This is
+  // common with reasoning deployments (e.g. gpt-5-mini) whose invisible
+  // chain-of-thought eats the budget before the JSON finishes. Surface the same
+  // actionable guidance instead of parseJsonObject's generic "did not return
+  // valid JSON" error, which gives no hint that the fix is a larger budget.
+  try {
+    return parseJsonObject(text);
+  } catch (e) {
+    if (finishReason === "length") {
+      throw new Error(
+        `Azure OpenAI returned truncated JSON (finish_reason=length): the model hit its ` +
+          `max_completion_tokens budget (${maxCompletionTokens}) mid-response, leaving incomplete JSON. ` +
+          `Raise AZURE_OPENAI_MAX_COMPLETION_TOKENS, use a smaller file, or a non-reasoning deployment.`,
+      );
+    }
+    throw e;
+  }
 }
 
 // ── Anthropic extraction ─────────────────────────────────────────────────────
